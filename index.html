@@ -51,6 +51,164 @@ import { createRoot } from "https://esm.sh/react-dom@18/client";
 const e = React.createElement;
 const { useState: uS, useEffect: uE, useRef: uR } = React;
 
+// ============== FOOD DATABASE (kcal per 100g unless noted) ==============
+// Common foods with rough kcal estimates. Used to auto-calculate meals from ingredients.
+const FOOD_DB = {
+  // Grains & starches
+  "rice": { kcal: 130, unit: "g" },
+  "white rice": { kcal: 130, unit: "g" },
+  "brown rice": { kcal: 112, unit: "g" },
+  "pasta": { kcal: 158, unit: "g" },
+  "spaghetti": { kcal: 158, unit: "g" },
+  "bread": { kcal: 265, unit: "g" },
+  "white bread": { kcal: 265, unit: "g" },
+  "whole grain bread": { kcal: 247, unit: "g" },
+  "potato": { kcal: 77, unit: "g" },
+  "sweet potato": { kcal: 86, unit: "g" },
+  "oats": { kcal: 389, unit: "g" },
+  "oatmeal": { kcal: 68, unit: "g" },
+  "quinoa": { kcal: 120, unit: "g" },
+  "couscous": { kcal: 112, unit: "g" },
+  "tortilla": { kcal: 218, unit: "g" },
+  "noodles": { kcal: 138, unit: "g" },
+  // Proteins
+  "chicken": { kcal: 165, unit: "g" },
+  "chicken breast": { kcal: 165, unit: "g" },
+  "chicken thigh": { kcal: 209, unit: "g" },
+  "beef": { kcal: 250, unit: "g" },
+  "ground beef": { kcal: 254, unit: "g" },
+  "steak": { kcal: 271, unit: "g" },
+  "pork": { kcal: 242, unit: "g" },
+  "bacon": { kcal: 541, unit: "g" },
+  "salmon": { kcal: 208, unit: "g" },
+  "tuna": { kcal: 132, unit: "g" },
+  "cod": { kcal: 82, unit: "g" },
+  "shrimp": { kcal: 99, unit: "g" },
+  "egg": { kcal: 78, unit: "piece" },
+  "eggs": { kcal: 78, unit: "piece" },
+  "tofu": { kcal: 76, unit: "g" },
+  "tempeh": { kcal: 192, unit: "g" },
+  "lentils": { kcal: 116, unit: "g" },
+  "chickpeas": { kcal: 164, unit: "g" },
+  "black beans": { kcal: 132, unit: "g" },
+  // Dairy
+  "milk": { kcal: 42, unit: "ml" },
+  "whole milk": { kcal: 61, unit: "ml" },
+  "skim milk": { kcal: 34, unit: "ml" },
+  "almond milk": { kcal: 17, unit: "ml" },
+  "oat milk": { kcal: 47, unit: "ml" },
+  "yogurt": { kcal: 59, unit: "g" },
+  "greek yogurt": { kcal: 97, unit: "g" },
+  "cheese": { kcal: 402, unit: "g" },
+  "cheddar": { kcal: 402, unit: "g" },
+  "mozzarella": { kcal: 280, unit: "g" },
+  "feta": { kcal: 264, unit: "g" },
+  "cottage cheese": { kcal: 98, unit: "g" },
+  "butter": { kcal: 717, unit: "g" },
+  "cream": { kcal: 340, unit: "ml" },
+  // Vegetables
+  "vegetables": { kcal: 35, unit: "g" },
+  "veggies": { kcal: 35, unit: "g" },
+  "veggis": { kcal: 35, unit: "g" },
+  "broccoli": { kcal: 34, unit: "g" },
+  "spinach": { kcal: 23, unit: "g" },
+  "lettuce": { kcal: 15, unit: "g" },
+  "tomato": { kcal: 18, unit: "g" },
+  "tomatoes": { kcal: 18, unit: "g" },
+  "cucumber": { kcal: 16, unit: "g" },
+  "carrot": { kcal: 41, unit: "g" },
+  "carrots": { kcal: 41, unit: "g" },
+  "onion": { kcal: 40, unit: "g" },
+  "bell pepper": { kcal: 31, unit: "g" },
+  "pepper": { kcal: 31, unit: "g" },
+  "zucchini": { kcal: 17, unit: "g" },
+  "mushrooms": { kcal: 22, unit: "g" },
+  "cauliflower": { kcal: 25, unit: "g" },
+  "kale": { kcal: 49, unit: "g" },
+  "asparagus": { kcal: 20, unit: "g" },
+  "green beans": { kcal: 31, unit: "g" },
+  "corn": { kcal: 86, unit: "g" },
+  "peas": { kcal: 81, unit: "g" },
+  "salad": { kcal: 20, unit: "g" },
+  // Fruits
+  "apple": { kcal: 52, unit: "g" },
+  "banana": { kcal: 89, unit: "g" },
+  "orange": { kcal: 47, unit: "g" },
+  "berries": { kcal: 57, unit: "g" },
+  "blueberries": { kcal: 57, unit: "g" },
+  "strawberries": { kcal: 32, unit: "g" },
+  "raspberries": { kcal: 52, unit: "g" },
+  "grapes": { kcal: 69, unit: "g" },
+  "mango": { kcal: 60, unit: "g" },
+  "pineapple": { kcal: 50, unit: "g" },
+  "avocado": { kcal: 160, unit: "g" },
+  // Fats & oils
+  "olive oil": { kcal: 884, unit: "ml" },
+  "oil": { kcal: 884, unit: "ml" },
+  "coconut oil": { kcal: 862, unit: "ml" },
+  "peanut butter": { kcal: 588, unit: "g" },
+  "almonds": { kcal: 579, unit: "g" },
+  "nuts": { kcal: 607, unit: "g" },
+  "walnuts": { kcal: 654, unit: "g" },
+  "cashews": { kcal: 553, unit: "g" },
+  "seeds": { kcal: 559, unit: "g" },
+  "chia seeds": { kcal: 486, unit: "g" },
+  // Sauces & misc
+  "ketchup": { kcal: 112, unit: "g" },
+  "mayo": { kcal: 680, unit: "g" },
+  "mayonnaise": { kcal: 680, unit: "g" },
+  "soy sauce": { kcal: 53, unit: "ml" },
+  "honey": { kcal: 304, unit: "g" },
+  "sugar": { kcal: 387, unit: "g" },
+  "chocolate": { kcal: 546, unit: "g" },
+  "protein powder": { kcal: 380, unit: "g" },
+  "protein shake": { kcal: 100, unit: "ml" },
+  // Drinks
+  "juice": { kcal: 45, unit: "ml" },
+  "orange juice": { kcal: 45, unit: "ml" },
+  "soda": { kcal: 41, unit: "ml" },
+  "coke": { kcal: 41, unit: "ml" },
+  "beer": { kcal: 43, unit: "ml" },
+  "wine": { kcal: 83, unit: "ml" },
+};
+
+// Estimate kcal for an ingredient
+const estimateIngredientKcal = (name, amount, unit) => {
+  if (!name || !amount) return 0;
+  const key = name.toLowerCase().trim();
+  
+  // Try exact match, then partial match
+  let food = FOOD_DB[key];
+  if (!food) {
+    // Try to find a partial match
+    const matches = Object.keys(FOOD_DB).filter(k => 
+      key.includes(k) || k.includes(key)
+    ).sort((a, b) => b.length - a.length); // longest match wins
+    if (matches.length > 0) food = FOOD_DB[matches[0]];
+  }
+  if (!food) return null; // unknown food
+  
+  const amt = parseFloat(amount);
+  if (isNaN(amt)) return 0;
+  
+  // Convert amount to base unit (food.unit is per 100g/100ml/1 piece)
+  if (food.unit === "piece") {
+    return Math.round(food.kcal * amt);
+  }
+  
+  // Handle unit conversion
+  let amtInBaseUnit = amt;
+  if (unit === "kg") amtInBaseUnit = amt * 1000;
+  else if (unit === "l") amtInBaseUnit = amt * 1000;
+  else if (unit === "tbsp") amtInBaseUnit = amt * 15; // ~15g/ml
+  else if (unit === "tsp") amtInBaseUnit = amt * 5;
+  else if (unit === "cup") amtInBaseUnit = amt * 240;
+  else if (unit === "oz") amtInBaseUnit = amt * 28;
+  // g, ml stay as-is
+  
+  return Math.round((food.kcal * amtInBaseUnit) / 100);
+};
+
 // ============== STORAGE LAYER ==============
 const STORAGE_KEY = "fitsync_v1";
 
@@ -113,13 +271,29 @@ const parseStrongOCR = (rawText) => {
   
   const exercises = [];
   let currentExercise = null;
-  let workoutMeta = { name: "Workout", duration: 60, totalVolume: 0, prCount: 0 };
+  let workoutMeta = { name: null, duration: 60, totalVolume: 0, prCount: 0 };
   let treadmillCount = 0;
   
   // Try to find workout name (often "Pull", "Push", "Legs", "Upper", "Lower" near top)
-  for (const line of lines.slice(0, 5)) {
-    if (/^(Pull|Push|Legs|Upper|Lower|Full Body|Chest|Back|Arms|Shoulders|Cardio)$/i.test(line)) {
-      workoutMeta.name = line;
+  // Scan more lines since OCR may have artifacts at top
+  const namePattern = /^(Pull|Push|Legs?|Upper|Lower|Full[\s-]?Body|Chest|Back|Arms?|Shoulders?|Cardio|Glutes?)$/i;
+  for (const line of lines.slice(0, 15)) {
+    if (namePattern.test(line.trim())) {
+      // Normalize the name
+      const normalized = line.trim().toLowerCase();
+      if (normalized.startsWith('pull')) workoutMeta.name = 'Pull';
+      else if (normalized.startsWith('push')) workoutMeta.name = 'Push';
+      else if (normalized.startsWith('leg')) workoutMeta.name = 'Legs';
+      else if (normalized.includes('upper')) workoutMeta.name = 'Upper';
+      else if (normalized.includes('lower')) workoutMeta.name = 'Lower';
+      else if (normalized.includes('full')) workoutMeta.name = 'Full Body';
+      else if (normalized.includes('chest')) workoutMeta.name = 'Chest';
+      else if (normalized.includes('back')) workoutMeta.name = 'Back';
+      else if (normalized.includes('arm')) workoutMeta.name = 'Arms';
+      else if (normalized.includes('shoulder')) workoutMeta.name = 'Shoulders';
+      else if (normalized.includes('cardio')) workoutMeta.name = 'Cardio';
+      else if (normalized.includes('glute')) workoutMeta.name = 'Glutes';
+      else workoutMeta.name = line.trim();
       break;
     }
   }
@@ -243,6 +417,28 @@ const parseStrongOCR = (rawText) => {
     exercises.push(currentExercise);
   }
   
+  // Fallback: infer workout name from exercise composition
+  if (!workoutMeta.name) {
+    const allText = exercises.map(ex => ex.name.toLowerCase()).join(' ');
+    const pullKeywords = ['row', 'pulldown', 'pull.?up', 'curl', 'lat ', 'bicep', 'rear delt', 'face pull', 'shrug', 'reverse fly', 'gorilla'];
+    const pushKeywords = ['bench', 'press', 'push.?up', 'fly ', 'tricep', 'dip', 'shoulder press', 'chest', 'overhead'];
+    const legKeywords = ['squat', 'deadlift', 'lunge', 'leg ', 'calf', 'hamstring', 'quad', 'glute', 'hip thrust', 'romanian'];
+    const cardioKeywords = ['running', 'treadmill', 'cycling', 'rowing', 'elliptical', 'stairmaster'];
+    
+    let pullScore = 0, pushScore = 0, legScore = 0, cardioScore = 0;
+    pullKeywords.forEach(k => { if (new RegExp(k, 'i').test(allText)) pullScore++; });
+    pushKeywords.forEach(k => { if (new RegExp(k, 'i').test(allText)) pushScore++; });
+    legKeywords.forEach(k => { if (new RegExp(k, 'i').test(allText)) legScore++; });
+    cardioKeywords.forEach(k => { if (new RegExp(k, 'i').test(allText)) cardioScore++; });
+    
+    const max = Math.max(pullScore, pushScore, legScore, cardioScore);
+    if (max === 0) workoutMeta.name = "Workout";
+    else if (pullScore === max) workoutMeta.name = "Pull";
+    else if (pushScore === max) workoutMeta.name = "Push";
+    else if (legScore === max) workoutMeta.name = "Legs";
+    else workoutMeta.name = "Cardio";
+  }
+  
   // Calculate kcal estimate using MET formula
   // Strength: ~5.5 MET, Cardio higher
   const bodyWeight = 75; // will be replaced by actual weight at call time
@@ -344,7 +540,8 @@ const App = () => {
 
   const totalEaten = data.meals.reduce((s, m) => s + m.kcal, 0);
   const totalBurned = data.workouts.reduce((s, w) => s + (w.kcal || 0), 0);
-  const caloriesLeft = data.caloriesGoal - totalEaten + totalBurned;
+  // Burned calories are shown as info but don't add to budget
+  const caloriesLeft = data.caloriesGoal - totalEaten;
   const calProgress = (totalEaten / data.caloriesGoal) * 100;
   const stepProgress = (data.steps / data.stepsGoal) * 100;
   const weightToGoal = (data.bodyWeight - data.targetWeight).toFixed(1);
@@ -1008,6 +1205,7 @@ const App = () => {
     // Edit workout modal
     editingWorkout && e(EditWorkoutModal, {
       workout: editingWorkout,
+      bodyWeight: data.bodyWeight,
       onClose: () => setEditingWorkout(null),
       onSave: (updated) => {
         updateData({ 
@@ -1258,13 +1456,41 @@ const WeightModal = ({ data, onClose, onSave }) => {
 
 const AddMealModal = ({ onClose, onSave }) => {
   const [name, setName] = uS("");
-  const [kcal, setKcal] = uS("");
   const [emoji, setEmoji] = uS("🍽️");
+  const [ingredients, setIngredients] = uS([{ name: "", amount: "", unit: "g" }]);
+  const [overrideKcal, setOverrideKcal] = uS("");
   const [saveAsTemplate, setSaveAsTemplate] = uS(false);
   
+  // Calculate total kcal from ingredients
+  const ingredientKcals = ingredients.map(ing => 
+    estimateIngredientKcal(ing.name, ing.amount, ing.unit)
+  );
+  const hasUnknown = ingredientKcals.some(k => k === null);
+  const estimatedTotal = ingredientKcals.reduce((sum, k) => sum + (k || 0), 0);
+  const finalKcal = overrideKcal !== "" ? parseInt(overrideKcal) || 0 : estimatedTotal;
+  
+  const updateIngredient = (idx, field, value) => {
+    const updated = [...ingredients];
+    updated[idx][field] = value;
+    setIngredients(updated);
+  };
+  
+  const addIngredient = () => {
+    setIngredients([...ingredients, { name: "", amount: "", unit: "g" }]);
+  };
+  
+  const removeIngredient = (idx) => {
+    if (ingredients.length === 1) {
+      setIngredients([{ name: "", amount: "", unit: "g" }]);
+    } else {
+      setIngredients(ingredients.filter((_, i) => i !== idx));
+    }
+  };
+  
   return e(Modal, { onClose, title: "Log a meal" },
+    // Emoji picker
     e('div', { className: "flex gap-2 mb-4 overflow-x-auto scrollbar-hide" },
-      ['🥣','🥗','🍕','🍔','🍱','🍝','🥤','🍎','🥑','🍌','🍣','🌮'].map(em => 
+      ['🥣','🥗','🍕','🍔','🍱','🍝','🥤','🍎','🥑','🍌','🍣','🌮','🍳','🥩','🍖'].map(em => 
         e('button', { 
           key: em,
           onClick: () => setEmoji(em),
@@ -1272,19 +1498,100 @@ const AddMealModal = ({ onClose, onSave }) => {
         }, em)
       )
     ),
+    
+    // Meal name
+    e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, "Meal name"),
     e('input', { 
       value: name,
       onChange: (ev) => setName(ev.target.value),
-      placeholder: "What did you eat?",
-      className: "w-full bg-zinc-800 text-white rounded-xl px-4 py-3 mb-3 placeholder-zinc-500 outline-none focus:ring-2 focus:ring-emerald-400"
-    }),
-    e('input', { 
-      value: kcal,
-      onChange: (ev) => setKcal(ev.target.value),
-      type: "number",
-      placeholder: "Calories (kcal)",
+      placeholder: "e.g. Chicken bowl",
       className: "w-full bg-zinc-800 text-white rounded-xl px-4 py-3 mb-4 placeholder-zinc-500 outline-none focus:ring-2 focus:ring-emerald-400"
     }),
+    
+    // Ingredients
+    e('div', { className: "flex justify-between items-center mb-2" },
+      e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase" }, "Ingredients"),
+      e('button', { 
+        onClick: addIngredient,
+        className: "text-emerald-400 text-xs font-mono-d uppercase flex items-center gap-1 active:scale-95"
+      },
+        e(Icon, { d: icons.plus, size: 12 }),
+        "Add"
+      )
+    ),
+    e('div', { className: "space-y-2 mb-3" },
+      ingredients.map((ing, idx) => e('div', { key: idx, className: "bg-zinc-800 rounded-xl p-2.5" },
+        e('div', { className: "flex gap-2 items-center mb-1.5" },
+          e('input', {
+            value: ing.name,
+            onChange: (ev) => updateIngredient(idx, 'name', ev.target.value),
+            placeholder: "rice, chicken, ...",
+            className: "flex-1 bg-zinc-900 text-white text-sm rounded-lg px-3 py-2 placeholder-zinc-600 outline-none focus:ring-1 focus:ring-emerald-400"
+          }),
+          e('button', { 
+            onClick: () => removeIngredient(idx),
+            className: "w-7 h-7 flex items-center justify-center text-zinc-500 active:text-rose-400"
+          }, e(Icon, { d: icons.x, size: 14 }))
+        ),
+        e('div', { className: "flex gap-2 items-center" },
+          e('input', {
+            value: ing.amount,
+            onChange: (ev) => updateIngredient(idx, 'amount', ev.target.value),
+            type: "number",
+            placeholder: "80",
+            className: "flex-1 bg-zinc-900 text-white text-sm rounded-lg px-3 py-2 placeholder-zinc-600 outline-none focus:ring-1 focus:ring-emerald-400"
+          }),
+          e('select', {
+            value: ing.unit,
+            onChange: (ev) => updateIngredient(idx, 'unit', ev.target.value),
+            className: "bg-zinc-900 text-white text-sm rounded-lg px-2 py-2 outline-none focus:ring-1 focus:ring-emerald-400"
+          },
+            ['g', 'kg', 'ml', 'l', 'piece', 'tbsp', 'tsp', 'cup', 'oz'].map(u => 
+              e('option', { key: u, value: u }, u)
+            )
+          ),
+          // Show kcal for this ingredient
+          e('div', { className: "w-16 text-right" },
+            ing.name && ing.amount ? (
+              ingredientKcals[idx] === null ?
+                e('span', { className: "text-zinc-500 text-[10px] font-mono-d" }, "?") :
+                e('span', { className: "text-emerald-400 text-sm font-display font-semibold" }, 
+                  ingredientKcals[idx],
+                  e('span', { className: "text-[9px] text-zinc-500 ml-0.5" }, "kcal")
+                )
+            ) : null
+          )
+        )
+      ))
+    ),
+    
+    // Estimated total + override
+    e('div', { className: `rounded-xl p-3 mb-4 border ${overrideKcal !== "" ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-zinc-800 border-white/5'}` },
+      e('div', { className: "flex justify-between items-center mb-2" },
+        e('p', { className: "text-[10px] text-zinc-400 font-mono-d uppercase" }, 
+          overrideKcal !== "" ? "Manual override" : "Estimated total"
+        ),
+        hasUnknown && overrideKcal === "" && e('span', { className: "text-[9px] text-orange-400 font-mono-d uppercase" }, "Some unknown")
+      ),
+      e('div', { className: "flex items-center gap-2" },
+        e('input', {
+          value: overrideKcal !== "" ? overrideKcal : (estimatedTotal || ""),
+          onChange: (ev) => setOverrideKcal(ev.target.value),
+          type: "number",
+          placeholder: "kcal",
+          className: "flex-1 bg-transparent text-white text-2xl font-display font-bold outline-none"
+        }),
+        e('span', { className: "text-zinc-500 text-sm font-mono-d" }, "kcal"),
+        overrideKcal !== "" && e('button', { 
+          onClick: () => setOverrideKcal(""),
+          className: "text-zinc-500 text-[10px] font-mono-d uppercase ml-2 active:scale-95"
+        }, "↻ auto")
+      ),
+      hasUnknown && overrideKcal === "" && e('p', { className: "text-[10px] text-zinc-500 mt-2" }, 
+        "Tap the field above to enter a manual value"
+      )
+    ),
+    
     e('button', { 
       onClick: () => setSaveAsTemplate(!saveAsTemplate),
       className: "w-full bg-zinc-800 rounded-xl px-4 py-3 mb-4 flex items-center gap-3 active:scale-[0.98]"
@@ -1295,6 +1602,7 @@ const AddMealModal = ({ onClose, onSave }) => {
       e('span', { className: "text-white text-sm font-display flex-1 text-left" }, "Save as favorite for next time"),
       e(Icon, { d: icons.star, size: 16, className: saveAsTemplate ? 'text-yellow-400' : 'text-zinc-600', fill: saveAsTemplate ? 'currentColor' : 'none' })
     ),
+    
     e('div', { className: "flex gap-3" },
       e('button', { 
         onClick: onClose,
@@ -1302,7 +1610,15 @@ const AddMealModal = ({ onClose, onSave }) => {
       }, "Cancel"),
       e('button', { 
         onClick: () => {
-          if (name && kcal) onSave({ name, kcal: parseInt(kcal), emoji }, saveAsTemplate);
+          if (name && finalKcal > 0) {
+            const validIngredients = ingredients.filter(i => i.name && i.amount);
+            onSave({ 
+              name, 
+              kcal: finalKcal, 
+              emoji,
+              ingredients: validIngredients
+            }, saveAsTemplate);
+          }
         },
         className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
       },
@@ -1315,20 +1631,121 @@ const AddMealModal = ({ onClose, onSave }) => {
 
 const EditMealModal = ({ meal, onClose, onSave, onDelete }) => {
   const [name, setName] = uS(meal.name);
+  const [ingredients, setIngredients] = uS(meal.ingredients && meal.ingredients.length > 0 ? meal.ingredients : []);
   const [kcal, setKcal] = uS(String(meal.kcal));
+  const [overrideKcal, setOverrideKcal] = uS(false);
+  
+  const ingredientKcals = ingredients.map(ing => 
+    estimateIngredientKcal(ing.name, ing.amount, ing.unit)
+  );
+  const estimatedTotal = ingredientKcals.reduce((sum, k) => sum + (k || 0), 0);
+  const finalKcal = overrideKcal || ingredients.length === 0 ? parseInt(kcal) || 0 : estimatedTotal;
+  
+  const updateIngredient = (idx, field, value) => {
+    const updated = [...ingredients];
+    updated[idx][field] = value;
+    setIngredients(updated);
+    if (!overrideKcal) {
+      const newKcals = updated.map(ing => estimateIngredientKcal(ing.name, ing.amount, ing.unit));
+      const newTotal = newKcals.reduce((s, k) => s + (k || 0), 0);
+      setKcal(String(newTotal));
+    }
+  };
+  
+  const addIngredient = () => {
+    setIngredients([...ingredients, { name: "", amount: "", unit: "g" }]);
+  };
+  
+  const removeIngredient = (idx) => {
+    const updated = ingredients.filter((_, i) => i !== idx);
+    setIngredients(updated);
+    if (!overrideKcal) {
+      const newKcals = updated.map(ing => estimateIngredientKcal(ing.name, ing.amount, ing.unit));
+      setKcal(String(newKcals.reduce((s, k) => s + (k || 0), 0)));
+    }
+  };
   
   return e(Modal, { onClose, title: "Edit meal" },
+    e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, "Name"),
     e('input', { 
       value: name,
       onChange: (ev) => setName(ev.target.value),
-      className: "w-full bg-zinc-800 text-white rounded-xl px-4 py-3 mb-3 outline-none focus:ring-2 focus:ring-emerald-400"
-    }),
-    e('input', { 
-      value: kcal,
-      onChange: (ev) => setKcal(ev.target.value),
-      type: "number",
       className: "w-full bg-zinc-800 text-white rounded-xl px-4 py-3 mb-4 outline-none focus:ring-2 focus:ring-emerald-400"
     }),
+    
+    // Ingredients (if any) — editable list
+    ingredients.length > 0 && e('div', { className: "flex justify-between items-center mb-2" },
+      e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase" }, "Ingredients"),
+      e('button', { 
+        onClick: addIngredient,
+        className: "text-emerald-400 text-xs font-mono-d uppercase flex items-center gap-1 active:scale-95"
+      },
+        e(Icon, { d: icons.plus, size: 12 }),
+        "Add"
+      )
+    ),
+    ingredients.length > 0 && e('div', { className: "space-y-2 mb-3" },
+      ingredients.map((ing, idx) => e('div', { key: idx, className: "bg-zinc-800 rounded-xl p-2.5" },
+        e('div', { className: "flex gap-2 items-center mb-1.5" },
+          e('input', {
+            value: ing.name,
+            onChange: (ev) => updateIngredient(idx, 'name', ev.target.value),
+            className: "flex-1 bg-zinc-900 text-white text-sm rounded-lg px-3 py-2 outline-none focus:ring-1 focus:ring-emerald-400"
+          }),
+          e('button', { 
+            onClick: () => removeIngredient(idx),
+            className: "w-7 h-7 flex items-center justify-center text-zinc-500"
+          }, e(Icon, { d: icons.x, size: 14 }))
+        ),
+        e('div', { className: "flex gap-2 items-center" },
+          e('input', {
+            value: ing.amount,
+            onChange: (ev) => updateIngredient(idx, 'amount', ev.target.value),
+            type: "number",
+            className: "flex-1 bg-zinc-900 text-white text-sm rounded-lg px-3 py-2 outline-none focus:ring-1 focus:ring-emerald-400"
+          }),
+          e('select', {
+            value: ing.unit,
+            onChange: (ev) => updateIngredient(idx, 'unit', ev.target.value),
+            className: "bg-zinc-900 text-white text-sm rounded-lg px-2 py-2 outline-none"
+          },
+            ['g', 'kg', 'ml', 'l', 'piece', 'tbsp', 'tsp', 'cup', 'oz'].map(u => 
+              e('option', { key: u, value: u }, u)
+            )
+          ),
+          e('div', { className: "w-16 text-right" },
+            ingredientKcals[idx] !== null && ing.name && ing.amount &&
+              e('span', { className: "text-emerald-400 text-sm font-display font-semibold" }, 
+                ingredientKcals[idx]
+              )
+          )
+        )
+      ))
+    ),
+    
+    // Add ingredients button if none
+    ingredients.length === 0 && e('button', { 
+      onClick: addIngredient,
+      className: "w-full bg-zinc-800 text-emerald-400 rounded-xl py-2.5 mb-4 text-xs font-mono-d uppercase flex items-center justify-center gap-1 active:scale-95"
+    },
+      e(Icon, { d: icons.plus, size: 12 }),
+      "Add ingredients"
+    ),
+    
+    // Total kcal
+    e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, "Total calories"),
+    e('div', { className: "bg-zinc-800 rounded-xl p-3 mb-4" },
+      e('div', { className: "flex items-center gap-2" },
+        e('input', { 
+          value: kcal,
+          onChange: (ev) => { setKcal(ev.target.value); setOverrideKcal(true); },
+          type: "number",
+          className: "flex-1 bg-transparent text-white text-2xl font-display font-bold outline-none"
+        }),
+        e('span', { className: "text-zinc-500 text-sm font-mono-d" }, "kcal")
+      )
+    ),
+    
     e('div', { className: "flex gap-3" },
       e('button', { 
         onClick: onDelete,
@@ -1341,33 +1758,21 @@ const EditMealModal = ({ meal, onClose, onSave, onDelete }) => {
         className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
       }, "Cancel"),
       e('button', { 
-        onClick: () => onSave({ ...meal, name, kcal: parseInt(kcal) || 0 }),
+        onClick: () => onSave({ 
+          ...meal, 
+          name, 
+          kcal: parseInt(kcal) || 0,
+          ingredients: ingredients.filter(i => i.name && i.amount)
+        }),
         className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold"
       }, "Save")
     )
   );
 };
 
-const EditWorkoutModal = ({ workout, onClose, onSave, onDelete }) => {
+const EditWorkoutModal = ({ workout, bodyWeight, onClose, onSave, onDelete }) => {
   const [w, setW] = uS(JSON.parse(JSON.stringify(workout)));
-  
-  const updateSet = (exIdx, setIdx, field, value) => {
-    const updated = { ...w };
-    updated.exercises[exIdx].sets[setIdx][field] = value === "" ? "" : parseFloat(value);
-    setW(updated);
-  };
-  
-  const removeSet = (exIdx, setIdx) => {
-    const updated = { ...w };
-    updated.exercises[exIdx].sets.splice(setIdx, 1);
-    setW(updated);
-  };
-  
-  const removeExercise = (exIdx) => {
-    const updated = { ...w };
-    updated.exercises.splice(exIdx, 1);
-    setW(updated);
-  };
+  const [kcalEdited, setKcalEdited] = uS(false);
   
   // Recompute total volume
   const recalcVolume = (workout) => {
@@ -1378,6 +1783,47 @@ const EditWorkoutModal = ({ workout, onClose, onSave, onDelete }) => {
       }
     }
     return Math.round(total);
+  };
+  
+  // Recompute kcal from MET formula
+  const recalcKcal = (duration) => {
+    return Math.round(5.5 * (bodyWeight || 75) * (duration / 60));
+  };
+  
+  const updateSet = (exIdx, setIdx, field, value) => {
+    const updated = { ...w };
+    updated.exercises[exIdx].sets[setIdx][field] = value === "" ? "" : parseFloat(value);
+    updated.totalVolume = recalcVolume(updated);
+    setW(updated);
+  };
+  
+  const removeSet = (exIdx, setIdx) => {
+    const updated = { ...w };
+    updated.exercises[exIdx].sets.splice(setIdx, 1);
+    updated.totalVolume = recalcVolume(updated);
+    setW(updated);
+  };
+  
+  const removeExercise = (exIdx) => {
+    const updated = { ...w };
+    updated.exercises.splice(exIdx, 1);
+    updated.totalVolume = recalcVolume(updated);
+    setW(updated);
+  };
+  
+  const updateDuration = (newDuration) => {
+    const dur = parseInt(newDuration) || 0;
+    const updated = { ...w, duration: dur };
+    // Auto-recalc kcal unless user has manually overridden
+    if (!kcalEdited) {
+      updated.kcal = recalcKcal(dur);
+    }
+    setW(updated);
+  };
+  
+  const updateKcal = (newKcal) => {
+    setKcalEdited(true);
+    setW({ ...w, kcal: parseInt(newKcal) || 0 });
   };
   
   return e(Modal, { onClose, title: "Edit workout", subtitle: "Tap any value to change it" },
@@ -1396,20 +1842,30 @@ const EditWorkoutModal = ({ workout, onClose, onSave, onDelete }) => {
         e('input', {
           value: w.duration,
           type: "number",
-          onChange: (ev) => setW({ ...w, duration: parseInt(ev.target.value) || 0 }),
+          onChange: (ev) => updateDuration(ev.target.value),
           className: "w-full bg-transparent text-white font-display font-semibold outline-none"
         })
       )
     ),
-    e('div', { className: "bg-orange-500/10 border border-orange-500/20 rounded-xl p-3 mb-4" },
-      e('p', { className: "text-[9px] text-orange-400 font-mono-d uppercase mb-1" }, "Calories burned"),
+    e('div', { className: "bg-orange-500/10 border border-orange-500/20 rounded-xl p-3 mb-2" },
+      e('p', { className: "text-[9px] text-orange-400 font-mono-d uppercase mb-1 flex items-center justify-between" }, 
+        "Calories burned",
+        kcalEdited && e('span', { className: "text-zinc-500" }, "manually set")
+      ),
       e('input', {
         value: w.kcal,
         type: "number",
-        onChange: (ev) => setW({ ...w, kcal: parseInt(ev.target.value) || 0 }),
+        onChange: (ev) => updateKcal(ev.target.value),
         className: "w-full bg-transparent text-white font-display font-bold text-xl outline-none"
       })
     ),
+    e('p', { className: "text-[9px] text-zinc-600 font-mono-d mb-4 text-center" }, 
+      kcalEdited ? "↻ Tap reset to use auto-estimate" : `Auto-estimated from duration · ${w.totalVolume ? `vol ${(w.totalVolume/1000).toFixed(1)}t` : ''}`
+    ),
+    kcalEdited && e('button', { 
+      onClick: () => { setKcalEdited(false); setW({ ...w, kcal: recalcKcal(w.duration) }); },
+      className: "w-full bg-zinc-800 text-zinc-400 rounded-xl py-2 font-mono-d text-xs uppercase mb-4"
+    }, "Reset to auto"),
     
     // Exercises
     e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase mb-2" }, "Exercises"),
