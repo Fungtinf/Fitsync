@@ -211,6 +211,8 @@ const estimateIngredientKcal = (name, amount, unit) => {
 
 // ============== STORAGE LAYER ==============
 const STORAGE_KEY = "fitsync_v1";
+const SCHEMA_VERSION = 2; // Increment when changing data structure
+const BACKUP_REMINDER_DAYS = 5; // Remind user to backup after this many days
 
 const defaultData = {
   caloriesGoal: 2400,
@@ -229,6 +231,8 @@ const defaultData = {
   sex: "male", // "male" or "female"
   activityLevel: 1.4, // 1.2 sedentary, 1.375 light, 1.55 moderate, 1.725 very active
   goalType: "cut", // "cut", "maintain", "bulk"
+  // Training goal — affects rep ranges and progression suggestions
+  trainingGoal: "progressive_overload", // "progressive_overload", "hypertrophy", "strength", "endurance", "maintain"
   // Sleep & HR (manually entered as Apple Health can't be read by web apps)
   sleepHours: null,
   restingHR: null,
@@ -237,11 +241,30 @@ const defaultData = {
   coaching: null, // { date, summary, tips: [{title, detail, category}], tomorrow: [...], generatedAt }
   // Historical archive of all past coaching sessions for context (last 14 days)
   coachingHistory: [],
+  // Long-term workout history for per-exercise progress tracking (last 180 days)
+  workoutHistory: [],
+  // Long-term sleep history (last 90 days)
+  sleepHistory: [],
+  // Weekly workout target days (0=Sun, 1=Mon, ... 6=Sat)
+  // 'workout' = planned training day, 'rest' = planned rest day, null = unset
+  workoutSchedule: {
+    0: null, // Sunday
+    1: 'workout', // Monday
+    2: 'workout', // Tuesday
+    3: 'rest', // Wednesday
+    4: 'workout', // Thursday
+    5: 'workout', // Friday
+    6: 'workout', // Saturday
+  },
   savedMeals: [
     { id: 1, name: "Greek yogurt + berries", kcal: 320, emoji: "🥣", tag: "breakfast", protein: 22, carbs: 38, fats: 8 },
     { id: 2, name: "Pre-workout snack", kcal: 220, emoji: "🍌", tag: "snack", protein: 8, carbs: 42, fats: 3 },
   ],
   lastDate: new Date().toDateString(),
+  // Schema versioning for safe migrations on future updates
+  schemaVersion: SCHEMA_VERSION,
+  // Track last backup time to nudge user
+  lastBackupISO: null,
 };
 
 // ============== BMR / TDEE CALCULATIONS ==============
@@ -394,6 +417,318 @@ const generateSmartTips = (data, balance, tdee, isOnTrack, isTooAggressive, tota
   return tips.slice(0, 3);
 };
 
+// ============== TRAINING PROGRESSION ENGINE ==============
+// Generates next-session suggestions based on the user's training goal and history.
+// 
+// Goal definitions:
+// - progressive_overload: Double progression. Target rep range 6-10. Hit top → add 2.5kg, reset to bottom.
+// - hypertrophy: Higher volume. Target 8-12. Hit top of range → +2kg or +1 rep next session.
+// - strength: Heavy/low rep. Target 3-6. Hit top → +2.5-5kg.
+// - endurance: Higher reps. Target 12-20. Hit top → +1-2 reps or small weight bump.
+// - maintain: No progression suggestions, just confirm consistency.
+const TRAINING_GOALS = {
+  progressive_overload: {
+    label: "Progressive Overload",
+    emoji: "📈",
+    desc: "Double progression: build reps then add weight",
+    repMin: 6,
+    repMax: 10,
+    weightIncrement: 2.5, // kg
+    description: "Hit the top of the range, then add weight and start again from the bottom.",
+  },
+  hypertrophy: {
+    label: "Hypertrophy",
+    emoji: "💪",
+    desc: "Build muscle size with moderate weight + volume",
+    repMin: 8,
+    repMax: 12,
+    weightIncrement: 2.0,
+    description: "Focus on time under tension. Add reps before adding weight.",
+  },
+  strength: {
+    label: "Strength",
+    emoji: "🏋️",
+    desc: "Heavy weight, lower reps for max force",
+    repMin: 3,
+    repMax: 6,
+    weightIncrement: 5.0,
+    description: "Slower progression, larger weight jumps when ready.",
+  },
+  endurance: {
+    label: "Muscular Endurance",
+    emoji: "🔁",
+    desc: "Higher reps, lighter weights",
+    repMin: 12,
+    repMax: 20,
+    weightIncrement: 1.0,
+    description: "Build stamina. Push for more reps before increasing weight.",
+  },
+  maintain: {
+    label: "Maintain",
+    emoji: "🎯",
+    desc: "Stay consistent, no aggressive progression",
+    repMin: 8,
+    repMax: 12,
+    weightIncrement: 0,
+    description: "Match previous performance. Suggestions show last session's targets.",
+  },
+};
+
+// Generate progression suggestion for a single set
+// Returns: { suggestedWeight, suggestedReps, reason, status } or null if maintain mode
+const suggestNextSet = (lastSet, exerciseHistory, trainingGoal) => {
+  const goal = TRAINING_GOALS[trainingGoal] || TRAINING_GOALS.progressive_overload;
+  const { weight, reps } = lastSet;
+  if (!weight || !reps) return null; // not a strength set
+  
+  // Check if user hit top of rep range
+  if (reps >= goal.repMax) {
+    // Add weight, reset reps to bottom of range
+    return {
+      suggestedWeight: weight + goal.weightIncrement,
+      suggestedReps: goal.repMin,
+      reason: `Hit ${reps}+ reps — add weight, drop reps`,
+      status: "level_up",
+      icon: "⬆️",
+    };
+  }
+  
+  // Check if below rep range — suggest stay at this weight, push for more reps
+  if (reps < goal.repMin) {
+    return {
+      suggestedWeight: weight,
+      suggestedReps: Math.min(reps + 1, goal.repMin),
+      reason: `Below target range — push for ${goal.repMin}+ reps next time`,
+      status: "build_reps",
+      icon: "↗️",
+    };
+  }
+  
+  // In the rep range — push for one more rep at the same weight
+  if (reps < goal.repMax) {
+    return {
+      suggestedWeight: weight,
+      suggestedReps: reps + 1,
+      reason: `Try +1 rep at ${weight}kg to build toward ${goal.repMax}`,
+      status: "build_reps",
+      icon: "➕",
+    };
+  }
+  
+  return null;
+};
+
+// Get the most recent session of an exercise (excluding the workout being analyzed)
+const getPreviousExerciseSession = (exerciseName, workoutHistory, currentWorkoutId) => {
+  const all = (workoutHistory || []).filter(w => w.id !== currentWorkoutId);
+  // Sort newest first
+  const sorted = all.sort((a, b) => new Date(b.dateISO || b.date) - new Date(a.dateISO || a.date));
+  for (const workout of sorted) {
+    if (!workout.exercises) continue;
+    const ex = workout.exercises.find(e => e.name.toLowerCase() === exerciseName.toLowerCase());
+    if (ex && ex.sets && ex.sets.length > 0) {
+      return { workout, exercise: ex };
+    }
+  }
+  return null;
+};
+
+// Generate suggestions for an entire workout — returns map keyed by exercise name
+// Each entry: { exerciseName, sets: [{setNum, last, suggestion}] }
+const generateWorkoutSuggestions = (workout, workoutHistory, trainingGoal) => {
+  const suggestions = [];
+  if (!workout.exercises) return suggestions;
+  
+  for (const ex of workout.exercises) {
+    if (!ex.sets || ex.sets.length === 0) continue;
+    
+    // Cardio handling — different progression
+    if (ex.type === "stairmaster" || ex.type === "treadmill") {
+      const cardioSets = ex.sets.filter(s => s.duration);
+      if (cardioSets.length === 0) continue;
+      const last = cardioSets[cardioSets.length - 1];
+      const prev = getPreviousExerciseSession(ex.name, workoutHistory, workout.id);
+      
+      let suggestion;
+      if (!prev) {
+        suggestion = {
+          message: "First time tracked — establish baseline",
+          status: "baseline",
+          icon: "🎯",
+        };
+      } else {
+        const prevTotalDur = (prev.exercise.sets || [])
+          .filter(s => s.duration)
+          .reduce((sum, s) => sum + s.duration, 0);
+        const currentTotalDur = cardioSets.reduce((sum, s) => sum + s.duration, 0);
+        
+        if (currentTotalDur >= prevTotalDur) {
+          // Suggest +5 min or +1 level
+          suggestion = {
+            suggestedDuration: currentTotalDur + 5,
+            suggestedLevel: last.level ? last.level + 0.5 : null,
+            message: `Try +5 min OR +0.5 level next time`,
+            status: "level_up",
+            icon: "⬆️",
+          };
+        } else {
+          suggestion = {
+            suggestedDuration: prevTotalDur,
+            message: `Match previous: ${prevTotalDur} min`,
+            status: "rebuild",
+            icon: "↻",
+          };
+        }
+      }
+      
+      suggestions.push({
+        exerciseName: ex.name,
+        type: ex.type,
+        sets: cardioSets.map((s, i) => ({
+          setNum: s.set || i + 1,
+          last: s,
+          suggestion,
+        })),
+      });
+      continue;
+    }
+    
+    // Strength sets
+    const prev = getPreviousExerciseSession(ex.name, workoutHistory, workout.id);
+    const setSuggestions = ex.sets
+      .filter(s => s.weight && s.reps)
+      .map(s => {
+        let suggestion;
+        if (trainingGoal === "maintain") {
+          suggestion = {
+            suggestedWeight: s.weight,
+            suggestedReps: s.reps,
+            reason: "Match this performance",
+            status: "maintain",
+            icon: "🎯",
+          };
+        } else {
+          suggestion = suggestNextSet(s, workoutHistory, trainingGoal);
+        }
+        
+        // Compare to previous session for this exercise
+        let comparedToPrev = null;
+        if (prev) {
+          const matchingSet = prev.exercise.sets[s.set - 1] || prev.exercise.sets[0];
+          if (matchingSet && matchingSet.weight && matchingSet.reps) {
+            const volDelta = (s.weight * s.reps) - (matchingSet.weight * matchingSet.reps);
+            comparedToPrev = {
+              prevWeight: matchingSet.weight,
+              prevReps: matchingSet.reps,
+              improved: volDelta > 0,
+              equal: volDelta === 0,
+              regressed: volDelta < 0,
+              volDelta,
+            };
+          }
+        }
+        
+        return {
+          setNum: s.set,
+          last: s,
+          suggestion,
+          comparedToPrev,
+        };
+      });
+    
+    if (setSuggestions.length > 0) {
+      suggestions.push({
+        exerciseName: ex.name,
+        type: "strength",
+        sets: setSuggestions,
+        hasPrevious: !!prev,
+        previousDate: prev?.workout?.date,
+      });
+    }
+  }
+  
+  return suggestions;
+};
+
+// ============== TRENDS ANALYSIS HELPERS ==============
+
+// Build per-exercise progress data from workout history
+// Returns: [{ name, sessions: [{ date, bestSet: {weight, reps}, totalVolume, oneRMEstimate }] }]
+const buildExerciseProgress = (workoutHistory, todayWorkouts) => {
+  // Combine archived + today's workouts (today not yet archived)
+  const today = new Date().toDateString();
+  const todayDated = (todayWorkouts || []).map(w => ({ ...w, date: today, dateISO: new Date().toISOString() }));
+  const all = [...(workoutHistory || []), ...todayDated];
+  
+  const byExercise = {};
+  
+  for (const workout of all) {
+    if (!workout.exercises) continue;
+    for (const ex of workout.exercises) {
+      if (!ex.sets || ex.sets.length === 0) continue;
+      const name = ex.name;
+      if (!byExercise[name]) byExercise[name] = [];
+      
+      // Find heaviest weight × reps for this session (ignore cardio sets)
+      const weightedSets = ex.sets.filter(s => s.weight && s.reps);
+      if (weightedSets.length === 0) {
+        // Cardio session — track total duration/level instead
+        const cardioSets = ex.sets.filter(s => s.duration);
+        if (cardioSets.length > 0) {
+          const totalDur = cardioSets.reduce((sum, s) => sum + (s.duration || 0), 0);
+          const avgLevel = cardioSets.reduce((sum, s) => sum + (s.level || s.incline || 0), 0) / cardioSets.length;
+          byExercise[name].push({
+            date: workout.date,
+            dateISO: workout.dateISO,
+            type: "cardio",
+            totalDuration: totalDur,
+            avgLevel: Math.round(avgLevel * 10) / 10,
+          });
+        }
+        continue;
+      }
+      
+      // Strength: track best set + total volume
+      const bestSet = weightedSets.reduce((best, s) => 
+        (s.weight * s.reps > best.weight * best.reps) ? s : best
+      , weightedSets[0]);
+      const totalVolume = weightedSets.reduce((sum, s) => sum + (s.weight * s.reps), 0);
+      // Epley 1RM estimate
+      const heaviest = weightedSets.reduce((max, s) => s.weight > max.weight ? s : max, weightedSets[0]);
+      const oneRM = Math.round(heaviest.weight * (1 + heaviest.reps / 30));
+      
+      byExercise[name].push({
+        date: workout.date,
+        dateISO: workout.dateISO,
+        type: "strength",
+        bestSet: { weight: bestSet.weight, reps: bestSet.reps },
+        heaviestWeight: heaviest.weight,
+        totalVolume: Math.round(totalVolume),
+        oneRMEstimate: oneRM,
+      });
+    }
+  }
+  
+  // Sort each exercise's sessions by date and return only those with 2+ sessions
+  return Object.entries(byExercise)
+    .map(([name, sessions]) => {
+      const sorted = sessions.sort((a, b) => new Date(a.dateISO) - new Date(b.dateISO));
+      return { name, sessions: sorted };
+    })
+    .filter(ex => ex.sessions.length >= 1)
+    .sort((a, b) => b.sessions.length - a.sessions.length); // most-frequented first
+};
+
+// Build sleep history including today's logged sleep if available
+const buildSleepData = (sleepHistory, todaySleep) => {
+  const today = new Date().toDateString();
+  let combined = [...(sleepHistory || [])];
+  if (todaySleep !== null && todaySleep !== undefined) {
+    combined.push({ date: today, dateISO: new Date().toISOString(), hours: todaySleep });
+  }
+  return combined.sort((a, b) => new Date(a.dateISO) - new Date(b.dateISO));
+};
+
 // ============== AI COACHING (Claude API) ==============
 // Builds a comprehensive prompt with all user data and asks Claude for personalized advice.
 const generateAICoaching = async (data, apiKey) => {
@@ -540,11 +875,46 @@ Output ONLY valid JSON in this exact schema, nothing else:
   }
 };
 
+// Migration functions — applied in order based on stored schemaVersion
+const migrations = {
+  // From version 1 → 2: add workoutSchedule and schemaVersion fields
+  2: (data) => {
+    if (!data.workoutSchedule) {
+      data.workoutSchedule = { 0: null, 1: 'workout', 2: 'workout', 3: 'rest', 4: 'workout', 5: 'workout', 6: 'workout' };
+    }
+    if (!data.workoutHistory) data.workoutHistory = [];
+    if (!data.sleepHistory) data.sleepHistory = [];
+    if (!data.coachingHistory) data.coachingHistory = [];
+    return data;
+  },
+  // Future versions added here. Keep all migrations idempotent.
+};
+
+const applyMigrations = (data) => {
+  const fromVersion = data.schemaVersion || 1;
+  let migrated = { ...data };
+  for (let v = fromVersion + 1; v <= SCHEMA_VERSION; v++) {
+    if (migrations[v]) {
+      try {
+        migrated = migrations[v](migrated);
+        console.log(`Migrated to schema v${v}`);
+      } catch (err) {
+        console.error(`Migration v${v} failed:`, err);
+      }
+    }
+  }
+  migrated.schemaVersion = SCHEMA_VERSION;
+  return migrated;
+};
+
 const loadData = () => {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return { ...defaultData };
-    const parsed = JSON.parse(raw);
+    let parsed = JSON.parse(raw);
+    
+    // Apply migrations BEFORE any other processing
+    parsed = applyMigrations(parsed);
     
     // Daily reset for non-cumulative fields
     if (parsed.lastDate !== new Date().toDateString()) {
@@ -561,6 +931,26 @@ const loadData = () => {
       };
       parsed.coachingHistory = [...(parsed.coachingHistory || []), yesterdaySnapshot].slice(-14);
       
+      // Archive workouts into long-term history (180 days) with date attached
+      if (parsed.workouts && parsed.workouts.length > 0) {
+        const datedWorkouts = parsed.workouts.map(w => ({
+          ...w, 
+          date: parsed.lastDate, 
+          dateISO: new Date(parsed.lastDate).toISOString()
+        }));
+        parsed.workoutHistory = [...(parsed.workoutHistory || []), ...datedWorkouts].slice(-500);
+      }
+      
+      // Archive sleep into long-term history (90 days)
+      if (parsed.sleepHours !== null && parsed.sleepHours !== undefined) {
+        const sleepEntry = {
+          date: parsed.lastDate,
+          dateISO: new Date(parsed.lastDate).toISOString(),
+          hours: parsed.sleepHours,
+        };
+        parsed.sleepHistory = [...(parsed.sleepHistory || []), sleepEntry].slice(-90);
+      }
+      
       parsed.meals = [];
       parsed.workouts = [];
       parsed.water = 0;
@@ -568,6 +958,7 @@ const loadData = () => {
       parsed.sleepHours = null; // resets daily — must log fresh each morning
       parsed.lastDate = new Date().toDateString();
     }
+    // Use deep merge for new fields, but preserve user data
     return { ...defaultData, ...parsed };
   } catch (err) {
     console.error("Load error:", err);
@@ -582,6 +973,268 @@ const saveData = (data) => {
     console.error("Save error:", err);
   }
 };
+
+// ============== BACKUP / RESTORE ==============
+// Export all data (localStorage + IndexedDB photos as base64) as a single JSON file
+const exportAllData = async () => {
+  const lsData = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+  
+  // Export photos as base64 strings
+  let photosExport = [];
+  try {
+    const allPhotos = await photoStore.list();
+    photosExport = await Promise.all(allPhotos.map(async p => {
+      const blobToBase64 = (blob) => new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+      return {
+        ...p,
+        blob: await blobToBase64(p.blob),
+        thumbnail: await blobToBase64(p.thumbnail),
+      };
+    }));
+  } catch (err) {
+    console.warn("Photo export failed:", err);
+  }
+  
+  return {
+    appName: "FitSync",
+    schemaVersion: SCHEMA_VERSION,
+    exportedAt: new Date().toISOString(),
+    data: lsData,
+    photos: photosExport,
+  };
+};
+
+const downloadBackup = async () => {
+  const exportObj = await exportAllData();
+  const json = JSON.stringify(exportObj, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const dateStr = new Date().toISOString().slice(0, 10);
+  a.href = url;
+  a.download = `fitsync-backup-${dateStr}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  
+  // Update last backup time
+  const current = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+  current.lastBackupISO = new Date().toISOString();
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(current));
+  
+  return exportObj;
+};
+
+const importBackup = async (file) => {
+  const text = await file.text();
+  const parsed = JSON.parse(text);
+  
+  if (parsed.appName !== "FitSync" || !parsed.data) {
+    throw new Error("Not a valid FitSync backup file");
+  }
+  
+  // Restore localStorage data
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed.data));
+  
+  // Restore photos to IndexedDB
+  if (parsed.photos && parsed.photos.length > 0) {
+    const db = await openDB();
+    
+    // Clear existing photos first
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    
+    // Restore each photo
+    const base64ToBlob = async (dataUrl) => {
+      const res = await fetch(dataUrl);
+      return res.blob();
+    };
+    
+    for (const p of parsed.photos) {
+      const photo = {
+        ...p,
+        blob: await base64ToBlob(p.blob),
+        thumbnail: await base64ToBlob(p.thumbnail),
+      };
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE, "readwrite");
+        tx.objectStore(STORE).put(photo);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+  }
+  
+  return { success: true, photoCount: parsed.photos?.length || 0 };
+};
+
+// Check if user should see a backup reminder
+const shouldNudgeBackup = (data) => {
+  if (!data.lastBackupISO) {
+    // Never backed up — nudge if app has been used for 5+ days
+    if (!data.coachingHistory || data.coachingHistory.length < BACKUP_REMINDER_DAYS) return false;
+    return true;
+  }
+  const lastBackup = new Date(data.lastBackupISO);
+  const daysSince = (Date.now() - lastBackup.getTime()) / (1000 * 60 * 60 * 24);
+  return daysSince >= 7; // weekly reminder
+};
+
+// ============== INDEXEDDB PHOTO STORAGE ==============
+// Photos are stored separately in IndexedDB because they're too large for localStorage.
+// Each photo: { id, dateISO, blob, weight, notes, thumbnail }
+const DB_NAME = "fitsync_photos";
+const DB_VERSION = 1;
+const STORE = "progress_photos";
+
+let _dbPromise = null;
+const openDB = () => {
+  if (_dbPromise) return _dbPromise;
+  _dbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onerror = () => reject(req.error);
+    req.onupgradeneeded = (ev) => {
+      const db = ev.target.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        const store = db.createObjectStore(STORE, { keyPath: "id" });
+        store.createIndex("dateISO", "dateISO", { unique: false });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+  });
+  return _dbPromise;
+};
+
+// Resize image file → blob to keep storage under control
+const resizeImage = (file, maxW = 800, maxH = 1200, quality = 0.85) => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        // Maintain aspect ratio, fit within max bounds
+        const ratio = Math.min(maxW / width, maxH / height, 1);
+        width = Math.round(width * ratio);
+        height = Math.round(height * ratio);
+        
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        
+        canvas.toBlob((blob) => {
+          if (blob) resolve({ blob, width, height });
+          else reject(new Error("Canvas conversion failed"));
+        }, 'image/jpeg', quality);
+      };
+      img.onerror = () => reject(new Error("Image load failed"));
+      img.src = ev.target.result;
+    };
+    reader.onerror = () => reject(new Error("File read failed"));
+    reader.readAsDataURL(file);
+  });
+};
+
+// Create a small thumbnail for fast list rendering
+const createThumbnail = async (file) => {
+  const result = await resizeImage(file, 200, 300, 0.7);
+  return result.blob;
+};
+
+// Public photo API
+const photoStore = {
+  async add(file, metadata = {}) {
+    const db = await openDB();
+    const [resized, thumb] = await Promise.all([
+      resizeImage(file, 800, 1200, 0.85),
+      createThumbnail(file),
+    ]);
+    
+    const photo = {
+      id: `photo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      dateISO: new Date().toISOString(),
+      date: new Date().toDateString(),
+      blob: resized.blob,
+      thumbnail: thumb,
+      width: resized.width,
+      height: resized.height,
+      weight: metadata.weight || null,
+      notes: metadata.notes || "",
+      angle: metadata.angle || "front", // front, side, back
+    };
+    
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).add(photo);
+      tx.oncomplete = () => resolve(photo);
+      tx.onerror = () => reject(tx.error);
+    });
+  },
+  
+  async list() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, "readonly");
+      const req = tx.objectStore(STORE).getAll();
+      req.onsuccess = () => {
+        // Sort newest first
+        resolve((req.result || []).sort((a, b) => new Date(b.dateISO) - new Date(a.dateISO)));
+      };
+      req.onerror = () => reject(req.error);
+    });
+  },
+  
+  async delete(id) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  },
+  
+  async update(id, patch) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite");
+      const store = tx.objectStore(STORE);
+      const getReq = store.get(id);
+      getReq.onsuccess = () => {
+        const photo = getReq.result;
+        if (!photo) { reject(new Error("Photo not found")); return; }
+        Object.assign(photo, patch);
+        store.put(photo);
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  },
+  
+  async getStorageEstimate() {
+    if (navigator.storage && navigator.storage.estimate) {
+      const est = await navigator.storage.estimate();
+      return {
+        usedMB: Math.round((est.usage || 0) / 1024 / 1024 * 10) / 10,
+        quotaMB: Math.round((est.quota || 0) / 1024 / 1024),
+      };
+    }
+    return null;
+  },
+};
+
+// Convert blob to URL for img display (caller must revoke when done)
+const blobToURL = (blob) => URL.createObjectURL(blob);
 
 // ============== STRONG OCR PARSER ==============
 // Parses raw OCR text from a Strong screenshot into structured workout data.
@@ -860,6 +1513,16 @@ const App = () => {
   const [coachingLoading, setCoachingLoading] = uS(false);
   const [coachingError, setCoachingError] = uS(null);
   
+  // Photo state
+  const [photos, setPhotos] = uS([]);
+  const [photoStorage, setPhotoStorage] = uS(null);
+  
+  // Load photos from IndexedDB
+  uE(() => {
+    photoStore.list().then(setPhotos).catch(err => console.error("Photo load error:", err));
+    photoStore.getStorageEstimate().then(setPhotoStorage).catch(() => {});
+  }, [data._photoRefresh]);
+  
   const fileInputRef = uR(null);
   const touchStartX = uR(0);
   
@@ -956,7 +1619,20 @@ const App = () => {
     }
   };
 
-  const confirmImport = () => {
+  const confirmImport = (targetDate) => {
+    // targetDate is optional — if provided as a Date or ISO string, the workout is backdated
+    const today = new Date().toDateString();
+    let dateForWorkout = today;
+    let isBackdated = false;
+    
+    if (targetDate) {
+      const d = (targetDate instanceof Date) ? targetDate : new Date(targetDate);
+      dateForWorkout = d.toDateString();
+      if (dateForWorkout !== today) {
+        isBackdated = true;
+      }
+    }
+    
     const newWorkout = {
       id: Date.now(),
       name: importResult.name,
@@ -969,7 +1645,23 @@ const App = () => {
       totalVolume: importResult.totalVolume,
       prCount: importResult.prCount,
     };
-    updateData({ workouts: [...data.workouts, newWorkout] });
+    
+    if (isBackdated) {
+      // Add directly to workoutHistory with the past date
+      const datedWorkout = {
+        ...newWorkout,
+        date: dateForWorkout,
+        dateISO: new Date(dateForWorkout).toISOString(),
+        backdated: true,
+      };
+      updateData({ 
+        workoutHistory: [...(data.workoutHistory || []), datedWorkout].slice(-500)
+      });
+    } else {
+      // Add to today's workouts
+      updateData({ workouts: [...data.workouts, newWorkout] });
+    }
+    
     setImportResult(null);
   };
 
@@ -1010,7 +1702,32 @@ const App = () => {
             e('span', { className: "text-emerald-400" }, ".")
           )
         ),
-        e('div', { className: "w-11 h-11 rounded-full bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center text-white font-bold shadow-lg shadow-emerald-500/30" }, "F")
+        e('div', { className: "flex gap-2 items-center" },
+          // Backup button — shows orange dot if backup is overdue
+          e('button', { 
+            onClick: () => setModal('backup'),
+            className: "w-11 h-11 rounded-full bg-zinc-900 border border-white/5 flex items-center justify-center active:scale-95 relative"
+          },
+            e(Icon, { d: icons.target, size: 16, className: "text-zinc-400" }),
+            shouldNudgeBackup(data) && e('span', { className: "absolute top-1.5 right-2 w-2 h-2 bg-orange-400 rounded-full ring-2 ring-black animate-pulse" })
+          ),
+          e('div', { className: "w-11 h-11 rounded-full bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center text-white font-bold shadow-lg shadow-emerald-500/30" }, "F")
+        )
+      ),
+      
+      // Backup reminder banner (only if overdue)
+      shouldNudgeBackup(data) && e('button', { 
+        onClick: () => setModal('backup'),
+        className: "w-full bg-orange-500/10 border border-orange-500/30 rounded-xl px-4 py-3 mb-4 flex items-center gap-3 active:scale-[0.98] transition text-left"
+      },
+        e('span', { className: "text-xl" }, "💾"),
+        e('div', { className: "flex-1" },
+          e('p', { className: "text-orange-300 font-display font-semibold text-sm" }, 
+            data.lastBackupISO ? "Time to back up your data" : "Back up your data"
+          ),
+          e('p', { className: "text-orange-200/70 text-xs" }, "Tap to download a backup file")
+        ),
+        e(Icon, { d: icons.chevron, size: 16, className: "text-orange-400" })
       ),
 
       // Weight goal banner
@@ -1208,6 +1925,147 @@ const App = () => {
           )
         )
       ),
+
+      // WORKOUT WEEK PANEL (target days + completion status)
+      (() => {
+        // Compute Monday-Sunday of current week
+        const now = new Date();
+        const dayOfWeek = now.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
+        // Get Monday of current week
+        const monday = new Date(now);
+        const daysToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+        monday.setDate(now.getDate() - daysToMonday);
+        monday.setHours(0, 0, 0, 0);
+        
+        const weekDays = [];
+        const dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+        const dayIndices = [1, 2, 3, 4, 5, 6, 0]; // Mon=1 ... Sun=0
+        
+        for (let i = 0; i < 7; i++) {
+          const d = new Date(monday);
+          d.setDate(monday.getDate() + i);
+          const dStr = d.toDateString();
+          const dayIdx = dayIndices[i];
+          const isToday = dStr === now.toDateString();
+          const isFuture = d > now && !isToday;
+          const isPast = d < now && !isToday;
+          
+          let workoutDone = false;
+          if (isToday) {
+            workoutDone = data.workouts.length > 0;
+          } else {
+            const archived = (data.workoutHistory || []).filter(w => w.date === dStr);
+            workoutDone = archived.length > 0;
+          }
+          
+          weekDays.push({
+            label: dayLabels[i],
+            dayIndex: dayIdx,
+            date: dStr,
+            isToday,
+            isFuture,
+            isPast,
+            workoutDone,
+            target: data.workoutSchedule[dayIdx], // 'workout', 'rest', or null
+          });
+        }
+        
+        // Stats
+        const targetCount = weekDays.filter(d => d.target === 'workout').length;
+        const completedCount = weekDays.filter(d => d.target === 'workout' && d.workoutDone).length;
+        const restCount = weekDays.filter(d => d.target === 'rest').length;
+        
+        return e('div', { className: "rounded-2xl bg-zinc-900/80 border border-white/5 p-4 mb-4" },
+          // Header with set targets button
+          e('div', { className: "flex justify-between items-center mb-3" },
+            e('div', null,
+              e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase" }, "This week"),
+              e('p', { className: "text-white font-display font-semibold text-sm" }, 
+                targetCount > 0 ? 
+                  `${completedCount}/${targetCount} workouts` : 
+                  "Set your weekly schedule"
+              )
+            ),
+            e('button', { 
+              onClick: () => setModal('schedule'),
+              className: "bg-zinc-800 text-emerald-400 rounded-lg px-2.5 py-1.5 text-[10px] font-mono-d uppercase active:scale-95 flex items-center gap-1"
+            },
+              e(Icon, { d: icons.target, size: 11 }),
+              "Set targets"
+            )
+          ),
+          
+          // Day circles row
+          e('div', { className: "flex justify-between items-center gap-1.5 mb-2" },
+            weekDays.map((d, i) => {
+              // Determine circle styling
+              let circleClass = "bg-zinc-800 border border-zinc-700"; // default unset/no target
+              let circleContent = null;
+              let textClass = "text-zinc-500";
+              
+              if (d.target === 'rest') {
+                circleClass = "bg-zinc-800 border border-zinc-600";
+                circleContent = e('span', { className: "text-zinc-500 text-[10px]" }, "💤");
+                textClass = "text-zinc-500";
+              } else if (d.target === 'workout') {
+                if (d.workoutDone) {
+                  // Completed workout — green
+                  circleClass = "bg-emerald-400 border-2 border-emerald-300";
+                  circleContent = e('span', { className: "text-black text-xs font-bold" }, "✓");
+                  textClass = "text-emerald-400";
+                } else if (d.isToday) {
+                  // Today, scheduled, not yet done
+                  circleClass = "bg-zinc-800 border-2 border-emerald-400 ring-2 ring-emerald-400/30";
+                  textClass = "text-emerald-400";
+                } else if (d.isPast) {
+                  // Missed workout day
+                  circleClass = "bg-rose-500/20 border-2 border-rose-500/40";
+                  circleContent = e('span', { className: "text-rose-400 text-xs" }, "×");
+                  textClass = "text-rose-400";
+                } else {
+                  // Future scheduled
+                  circleClass = "bg-zinc-800 border-2 border-zinc-600 border-dashed";
+                  textClass = "text-zinc-400";
+                }
+              } else {
+                // No target set, but workout was done anyway
+                if (d.workoutDone) {
+                  circleClass = "bg-emerald-500/30 border border-emerald-500/50";
+                  circleContent = e('span', { className: "text-emerald-300 text-xs font-bold" }, "✓");
+                  textClass = "text-emerald-400";
+                }
+                if (d.isToday) {
+                  circleClass += " ring-1 ring-white/20";
+                }
+              }
+              
+              return e('div', { key: i, className: "flex-1 flex flex-col items-center gap-1.5" },
+                e('div', { 
+                  className: `w-9 h-9 rounded-full flex items-center justify-center ${circleClass}`
+                }, circleContent),
+                e('span', { className: `text-[10px] font-mono-d ${textClass}` }, d.label.charAt(0))
+              );
+            })
+          ),
+          
+          // Footer summary
+          e('div', { className: "flex justify-between items-center text-[10px] font-mono-d text-zinc-500 mt-1 pt-2 border-t border-white/5" },
+            e('span', null, 
+              `${targetCount} planned`,
+              restCount > 0 && ` · ${restCount} rest`
+            ),
+            e('span', { 
+              className: targetCount === 0 ? "text-zinc-600" :
+                completedCount === targetCount ? "text-emerald-400" : 
+                completedCount >= targetCount * 0.7 ? "text-yellow-400" : "text-zinc-400"
+            }, 
+              targetCount > 0 ? 
+                (completedCount === targetCount ? "✓ on track" : `${Math.round(completedCount/targetCount*100)}% done`) :
+                "tap set targets"
+            )
+          )
+        );
+      })(),
 
       // AI COACHING PREVIEW (shown if there's coaching available)
       data.coaching && (() => {
@@ -1567,11 +2425,36 @@ const App = () => {
           e('p', { className: "text-zinc-500 text-sm font-mono-d uppercase tracking-wider" }, "Training"),
           e('h1', { className: "text-white text-3xl font-display font-bold" }, "Sessions")
         ),
-        e('button', { 
-          onClick: () => fileInputRef.current?.click(),
-          className: "w-11 h-11 rounded-full bg-orange-400 flex items-center justify-center text-black active:scale-95 shadow-lg"
-        }, e(Icon, { d: icons.camera, size: 18, stroke: "black" }))
+        e('div', { className: "flex gap-2" },
+          e('button', { 
+            onClick: () => setModal('trainingsettings'),
+            className: "w-11 h-11 rounded-full bg-zinc-900 border border-white/5 flex items-center justify-center active:scale-95"
+          }, e(Icon, { d: icons.target, size: 16, className: "text-zinc-400" })),
+          e('button', { 
+            onClick: () => fileInputRef.current?.click(),
+            className: "w-11 h-11 rounded-full bg-orange-400 flex items-center justify-center text-black active:scale-95 shadow-lg"
+          }, e(Icon, { d: icons.camera, size: 18, stroke: "black" }))
+        )
       ),
+      
+      // Training goal banner
+      (() => {
+        const goalConfig = TRAINING_GOALS[data.trainingGoal || "progressive_overload"];
+        return e('button', { 
+          onClick: () => setModal('trainingsettings'),
+          className: "w-full bg-gradient-to-r from-emerald-500/10 to-cyan-500/5 border border-emerald-500/20 rounded-2xl p-3 mb-4 flex items-center gap-3 active:scale-[0.98] text-left"
+        },
+          e('div', { className: "w-10 h-10 rounded-xl bg-emerald-500/20 flex items-center justify-center text-xl" }, goalConfig.emoji),
+          e('div', { className: "flex-1" },
+            e('p', { className: "text-[10px] text-emerald-400 font-mono-d uppercase tracking-wider" }, "Training goal"),
+            e('p', { className: "text-white font-display font-semibold text-sm" }, goalConfig.label),
+            e('p', { className: "text-zinc-500 text-[10px] font-mono-d" }, 
+              `${goalConfig.repMin}-${goalConfig.repMax} reps · +${goalConfig.weightIncrement}kg progression`
+            )
+          ),
+          e(Icon, { d: icons.chevron, size: 16, className: "text-zinc-500" })
+        );
+      })(),
 
       e('div', { className: "bg-gradient-to-br from-orange-500/20 to-rose-500/10 rounded-3xl p-5 mb-5 border border-white/5" },
         e('div', { className: "grid grid-cols-3 gap-3" },
@@ -1808,8 +2691,16 @@ const App = () => {
       )
     ),
 
+    // ============ WHAT IF TAB ============
+    activeTab === "whatif" && e(WhatIfTab, { data, totalEaten, totalBurned, tdee, balance, goalRange }),
+
     // ============ TRENDS TAB ============
-    activeTab === "trends" && e('div', { className: "px-5 pt-4" },
+    activeTab === "trends" && (() => {
+      const exerciseProgress = buildExerciseProgress(data.workoutHistory, data.workouts);
+      const sleepData = buildSleepData(data.sleepHistory, data.sleepHours);
+      const [selectedExercise, setSelectedExerciseLocal] = [null, null]; // placeholder
+      
+      return e('div', { className: "px-5 pt-4" },
       e('div', { className: "mb-6" },
         e('p', { className: "text-zinc-500 text-sm font-mono-d uppercase tracking-wider" }, "Insights"),
         e('h1', { className: "text-white text-3xl font-display font-bold" }, "Your trends")
@@ -1840,20 +2731,279 @@ const App = () => {
           renderWeightChart(data, weightToGoal, weightLost)
       ),
 
-      // Stats cards
+      // Sleep trend
+      e('div', { className: "bg-zinc-900/80 rounded-3xl p-5 mb-4 border border-white/5" },
+        e('div', { className: "flex justify-between items-start mb-4" },
+          e('div', null,
+            e('h3', { className: "text-white font-display font-semibold flex items-center gap-2" },
+              e(Icon, { d: icons.moon, size: 16, className: "text-indigo-400" }),
+              "Sleep trend"
+            ),
+            e('p', { className: "text-zinc-500 text-xs font-mono-d uppercase mt-1" }, 
+              `${sleepData.length} nights logged`
+            )
+          ),
+          e('button', { 
+            onClick: () => setModal('sleep'),
+            className: "bg-indigo-500/20 text-indigo-300 rounded-lg px-2.5 py-1 text-[10px] font-mono-d uppercase active:scale-95"
+          }, "+ log")
+        ),
+        
+        sleepData.length < 2 ? 
+          e('p', { className: "text-zinc-600 text-sm text-center py-8 font-mono-d" }, 
+            sleepData.length === 0 ? "Log sleep daily to see trends" : "Need at least 2 nights"
+          ) :
+          renderSleepChart(sleepData)
+      ),
+
+      // Per-exercise progress
+      exerciseProgress.length > 0 && e('div', { className: "mb-4" },
+        e('div', { className: "flex justify-between items-start mb-3" },
+          e('div', null,
+            e('h3', { className: "text-white font-display font-semibold flex items-center gap-2" },
+              e(Icon, { d: icons.dumbbell, size: 16, className: "text-orange-400" }),
+              "Exercise progress"
+            ),
+            e('p', { className: "text-zinc-500 text-xs font-mono-d uppercase mt-1" }, 
+              `${exerciseProgress.length} exercises tracked`
+            )
+          )
+        ),
+        e('div', { className: "space-y-2" },
+          exerciseProgress.slice(0, 20).map(ex => 
+            renderExerciseProgressCard(ex)
+          ),
+          exerciseProgress.length > 20 && e('p', { className: "text-zinc-600 text-xs text-center mt-3 font-mono-d" }, 
+            `+${exerciseProgress.length - 20} more exercises in history`
+          )
+        )
+      ),
+      
+      exerciseProgress.length === 0 && e('div', { className: "bg-zinc-900/80 rounded-3xl p-5 border border-white/5 mb-4" },
+        e('h3', { className: "text-white font-display font-semibold flex items-center gap-2 mb-2" },
+          e(Icon, { d: icons.dumbbell, size: 16, className: "text-orange-400" }),
+          "Exercise progress"
+        ),
+        e('p', { className: "text-zinc-600 text-sm text-center py-4 font-mono-d" }, 
+          "Log workouts to see per-exercise progress"
+        )
+      ),
+
+      // BODY RECOMPOSITION INDICATOR
+      (() => {
+        const wHist = data.weightHistory || [];
+        const allWorkouts = [...(data.workoutHistory || []), ...data.workouts];
+        
+        // Need 4+ weeks of weight data and 8+ workouts to detect recomp
+        if (wHist.length < 4) {
+          return e('div', { className: "bg-zinc-900/80 rounded-3xl p-5 mb-4 border border-white/5" },
+            e('div', { className: "flex items-center gap-2 mb-2" },
+              e(Icon, { d: icons.activity, size: 16, className: "text-cyan-400" }),
+              e('h3', { className: "text-white font-display font-semibold" }, "Body recomposition")
+            ),
+            e('p', { className: "text-zinc-500 text-xs font-mono-d uppercase mb-3" }, 
+              `Need ${4 - wHist.length} more weight entries to detect`
+            ),
+            e('p', { className: "text-zinc-400 text-sm leading-snug" }, 
+              "Recomp = losing fat while gaining muscle. Detected by comparing weight trend vs strength trend over 4+ weeks."
+            )
+          );
+        }
+        
+        // Calculate weight trend over last 4 weeks (slope)
+        const recent = wHist.slice(-4);
+        const oldestW = recent[0].weight;
+        const newestW = recent[recent.length - 1].weight;
+        const weightChange = newestW - oldestW;
+        const weeksDiff = (new Date(recent[recent.length - 1].date) - new Date(recent[0].date)) / (1000 * 60 * 60 * 24 * 7);
+        const weightChangePerWeek = weeksDiff > 0 ? weightChange / weeksDiff : 0;
+        
+        // Calculate strength trend — compare recent 1RMs to earlier ones for top exercises
+        const exerciseProgress = buildExerciseProgress(data.workoutHistory, data.workouts);
+        const exercisesWith2Plus = exerciseProgress.filter(ex => 
+          ex.sessions.filter(s => s.type === 'strength').length >= 2
+        );
+        
+        if (exercisesWith2Plus.length < 3) {
+          return e('div', { className: "bg-zinc-900/80 rounded-3xl p-5 mb-4 border border-white/5" },
+            e('div', { className: "flex items-center gap-2 mb-2" },
+              e(Icon, { d: icons.activity, size: 16, className: "text-cyan-400" }),
+              e('h3', { className: "text-white font-display font-semibold" }, "Body recomposition")
+            ),
+            e('p', { className: "text-zinc-500 text-xs font-mono-d uppercase mb-3" }, 
+              `Need ${3 - exercisesWith2Plus.length} more repeated exercises`
+            ),
+            e('p', { className: "text-zinc-400 text-sm leading-snug" }, 
+              "Log the same exercises across multiple workouts so we can detect strength changes."
+            )
+          );
+        }
+        
+        // Average 1RM change across top 5 strength exercises
+        const topExercises = exercisesWith2Plus.slice(0, 5);
+        let totalRMChange = 0, exCount = 0;
+        for (const ex of topExercises) {
+          const strengthSessions = ex.sessions.filter(s => s.type === 'strength');
+          if (strengthSessions.length >= 2) {
+            const first = strengthSessions[0].oneRMEstimate;
+            const last = strengthSessions[strengthSessions.length - 1].oneRMEstimate;
+            totalRMChange += ((last - first) / first) * 100; // percent change
+            exCount++;
+          }
+        }
+        const avgStrengthChangePct = exCount > 0 ? totalRMChange / exCount : 0;
+        
+        // Determine status
+        let status, color, emoji, message;
+        const isWeightStable = Math.abs(weightChangePerWeek) < 0.2;
+        const isWeightDown = weightChangePerWeek <= -0.2;
+        const isWeightUp = weightChangePerWeek >= 0.2;
+        const strongUp = avgStrengthChangePct > 3;
+        const strongStable = Math.abs(avgStrengthChangePct) <= 3;
+        const strongDown = avgStrengthChangePct < -3;
+        
+        if (isWeightStable && strongUp) {
+          status = "Recomping 🎯";
+          color = "from-emerald-500/20 to-cyan-500/10 border-emerald-500/30";
+          emoji = "💪";
+          message = "Weight stable, strength up — you're building muscle while losing fat. Best-case scenario.";
+        } else if (isWeightDown && strongUp) {
+          status = "Cutting + getting stronger";
+          color = "from-emerald-500/20 to-cyan-500/10 border-emerald-500/30";
+          emoji = "🔥";
+          message = "Lost weight AND gained strength — rare and elite. Whatever you're doing, keep doing.";
+        } else if (isWeightDown && strongStable) {
+          status = "Healthy cut";
+          color = "from-cyan-500/20 to-blue-500/10 border-cyan-500/30";
+          emoji = "✓";
+          message = "Losing weight while maintaining strength — preserving muscle. Sustainable cut.";
+        } else if (isWeightDown && strongDown) {
+          status = "Losing too aggressive";
+          color = "from-orange-500/20 to-rose-500/10 border-orange-500/30";
+          emoji = "⚠️";
+          message = "Weight + strength both down — likely losing muscle. Increase protein, reduce deficit slightly.";
+        } else if (isWeightUp && strongUp) {
+          status = "Effective bulk";
+          color = "from-emerald-500/20 to-cyan-500/10 border-emerald-500/30";
+          emoji = "📈";
+          message = "Gaining weight + getting stronger — good lean bulk progress.";
+        } else if (isWeightUp && strongStable) {
+          status = "Slow bulk";
+          color = "from-yellow-500/20 to-orange-500/10 border-yellow-500/30";
+          emoji = "🤔";
+          message = "Gaining weight without strength gains — could be more fat than muscle. Push training intensity.";
+        } else {
+          status = "Maintaining";
+          color = "from-zinc-700/40 to-zinc-800/40 border-white/5";
+          emoji = "⚖️";
+          message = "Body composition relatively stable. Adjust deficit/surplus if you want to change direction.";
+        }
+        
+        return e('div', { className: `bg-gradient-to-br ${color} rounded-3xl p-5 mb-4 border` },
+          e('div', { className: "flex items-center justify-between mb-3" },
+            e('div', { className: "flex items-center gap-2" },
+              e(Icon, { d: icons.activity, size: 16, className: "text-cyan-400" }),
+              e('h3', { className: "text-white font-display font-semibold" }, "Body recomposition")
+            ),
+            e('span', { className: "text-2xl" }, emoji)
+          ),
+          e('p', { className: "text-white font-display font-bold text-lg mb-1" }, status),
+          e('p', { className: "text-zinc-300 text-xs leading-snug mb-4" }, message),
+          
+          e('div', { className: "grid grid-cols-2 gap-3 pt-3 border-t border-white/10" },
+            e('div', null,
+              e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase mb-1" }, "Weight 4 weeks"),
+              e('p', { 
+                className: `font-display font-bold ${weightChangePerWeek > 0 ? 'text-orange-300' : weightChangePerWeek < 0 ? 'text-emerald-300' : 'text-zinc-300'}`
+              }, 
+                weightChangePerWeek > 0 ? '+' : '',
+                weightChange.toFixed(1),
+                e('span', { className: "text-xs text-zinc-500 ml-1" }, "kg")
+              ),
+              e('p', { className: "text-[9px] text-zinc-600 font-mono-d" }, 
+                `${weightChangePerWeek > 0 ? '+' : ''}${weightChangePerWeek.toFixed(2)}kg/week`
+              )
+            ),
+            e('div', null,
+              e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase mb-1" }, "Avg strength"),
+              e('p', { 
+                className: `font-display font-bold ${avgStrengthChangePct > 0 ? 'text-emerald-300' : avgStrengthChangePct < 0 ? 'text-rose-300' : 'text-zinc-300'}`
+              }, 
+                avgStrengthChangePct > 0 ? '+' : '',
+                avgStrengthChangePct.toFixed(1),
+                e('span', { className: "text-xs text-zinc-500 ml-1" }, "%")
+              ),
+              e('p', { className: "text-[9px] text-zinc-600 font-mono-d" }, 
+                `across ${exCount} exercise${exCount !== 1 ? 's' : ''}`
+              )
+            )
+          )
+        );
+      })(),
+      
+      // PHOTO JOURNAL
+      e('div', { className: "bg-zinc-900/80 rounded-3xl p-5 mb-4 border border-white/5" },
+        e('div', { className: "flex justify-between items-start mb-4" },
+          e('div', null,
+            e('h3', { className: "text-white font-display font-semibold flex items-center gap-2" },
+              e(Icon, { d: icons.camera, size: 16, className: "text-pink-400" }),
+              "Progress photos"
+            ),
+            e('p', { className: "text-zinc-500 text-xs font-mono-d uppercase mt-1" }, 
+              `${photos.length} photo${photos.length !== 1 ? 's' : ''}`,
+              photoStorage && photoStorage.usedMB > 0 ? ` · ${photoStorage.usedMB}MB used` : ''
+            )
+          ),
+          e('button', { 
+            onClick: () => setModal('photo-add'),
+            className: "bg-pink-500/20 text-pink-300 rounded-lg px-2.5 py-1 text-[10px] font-mono-d uppercase active:scale-95 flex items-center gap-1"
+          }, e(Icon, { d: icons.plus, size: 11 }), "add")
+        ),
+        
+        photos.length === 0 ?
+          e('div', { className: "text-center py-6" },
+            e('div', { className: "text-4xl mb-2" }, "📸"),
+            e('p', { className: "text-zinc-400 text-sm font-display mb-1" }, "Start your photo journal"),
+            e('p', { className: "text-zinc-600 text-xs leading-snug px-4" }, 
+              "Weekly progress pics show changes the scale misses. Photos stored only on your phone."
+            )
+          ) :
+          e('div', { className: "grid grid-cols-3 gap-2" },
+            photos.slice(0, 12).map(photo => 
+              e(PhotoThumbnail, {
+                key: photo.id,
+                photo,
+                onClick: () => setModal({ type: 'photo-view', photo })
+              })
+            )
+          ),
+        
+        photos.length > 12 && e('p', { className: "text-zinc-600 text-xs text-center mt-3 font-mono-d" }, 
+          `+${photos.length - 12} more in archive`
+        )
+      ),
+      
+      // Quick stats
       e('div', { className: "grid grid-cols-2 gap-3" },
         e('div', { className: "bg-zinc-900/80 rounded-2xl p-4 border border-white/5" },
           e(Icon, { d: icons.dumbbell, size: 18, className: "text-orange-400 mb-2" }),
           e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase" }, "Total workouts"),
-          e('p', { className: "text-white text-2xl font-display font-bold" }, data.workouts.length)
+          e('p', { className: "text-white text-2xl font-display font-bold" }, 
+            (data.workoutHistory || []).length + data.workouts.length
+          )
         ),
         e('div', { className: "bg-zinc-900/80 rounded-2xl p-4 border border-white/5" },
           e(Icon, { d: icons.flame, size: 18, className: "text-rose-400 mb-2" }),
-          e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase" }, "Burned today"),
-          e('p', { className: "text-white text-2xl font-display font-bold" }, totalBurned)
+          e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase" }, "Avg sleep"),
+          e('p', { className: "text-white text-2xl font-display font-bold" }, 
+            sleepData.length > 0 ? 
+              `${(sleepData.reduce((s, d) => s + d.hours, 0) / sleepData.length).toFixed(1)}h` :
+              "—"
+          )
         )
       )
-    ),
+      );
+    })(),
 
     // ============ MODALS ============
     
@@ -1967,6 +3117,49 @@ const App = () => {
       onSave: (key) => { updateData({ anthropicApiKey: key }); setModal(null); }
     }),
     
+    // Backup/restore modal
+    modal === 'backup' && e(BackupModal, {
+      data,
+      onClose: () => setModal(null),
+      onImported: () => { window.location.reload(); }
+    }),
+    
+    // Training settings modal
+    modal === 'trainingsettings' && e(TrainingSettingsModal, {
+      data,
+      onClose: () => setModal(null),
+      onSave: (goal) => { updateData({ trainingGoal: goal }); setModal(null); }
+    }),
+    
+    // Schedule modal
+    modal === 'schedule' && e(ScheduleModal, {
+      data,
+      onClose: () => setModal(null),
+      onSave: (schedule) => { updateData({ workoutSchedule: schedule }); setModal(null); }
+    }),
+    
+    // Photo modal
+    modal === 'photo-add' && e(PhotoAddModal, {
+      data,
+      onClose: () => setModal(null),
+      onSaved: () => { 
+        setModal(null); 
+        // Trigger refresh of photos list
+        setData(prev => ({ ...prev, _photoRefresh: Date.now() }));
+      }
+    }),
+    
+    // Photo viewer modal
+    modal && modal.type === 'photo-view' && e(PhotoViewerModal, {
+      photo: modal.photo,
+      onClose: () => setModal(null),
+      onDelete: async () => {
+        await photoStore.delete(modal.photo.id);
+        setModal(null);
+        setData(prev => ({ ...prev, _photoRefresh: Date.now() }));
+      }
+    }),
+    
     // Saved meals modal
     modal === 'savedMeals' && e(Modal, { onClose: () => setModal(null), title: "Quick add", subtitle: "Tap any to log instantly" },
       data.savedMeals.length === 0 ? 
@@ -2033,6 +3226,8 @@ const App = () => {
     editingWorkout && e(EditWorkoutModal, {
       workout: editingWorkout,
       bodyWeight: data.bodyWeight,
+      workoutHistory: [...(data.workoutHistory || []), ...data.workouts.filter(w => w.id !== editingWorkout.id)],
+      trainingGoal: data.trainingGoal || "progressive_overload",
       onClose: () => setEditingWorkout(null),
       onSave: (updated) => {
         updateData({ 
@@ -2081,6 +3276,7 @@ const App = () => {
           { id: 'home', d: icons.activity, label: 'Home' },
           { id: 'food', d: icons.apple, label: 'Food' },
           { id: 'training', d: icons.dumbbell, label: 'Train' },
+          { id: 'whatif', d: icons.target, label: 'What if' },
           { id: 'coach', d: icons.sparkle, label: 'Coach', accent: true },
           { id: 'trends', d: icons.bar, label: 'Trends' },
         ].map(t => {
@@ -2088,17 +3284,17 @@ const App = () => {
           return e('button', { 
             key: t.id,
             onClick: () => { setActiveTab(t.id); setSwipedMealId(null); },
-            className: `flex flex-col items-center gap-1 px-2 py-2 rounded-2xl transition ${active ? 'bg-white/5' : ''}`
+            className: `flex flex-col items-center gap-0.5 px-1.5 py-2 rounded-2xl transition ${active ? 'bg-white/5' : ''}`
           },
             e(Icon, { 
               d: t.d, 
-              size: 20, 
+              size: 18, 
               className: active 
                 ? (t.accent ? 'text-yellow-400' : 'text-emerald-400') 
                 : (t.accent ? 'text-yellow-500/60' : 'text-zinc-500')
             }),
             e('span', { 
-              className: `text-[10px] font-mono-d ${active ? 'text-white' : 'text-zinc-600'}` 
+              className: `text-[9px] font-mono-d ${active ? 'text-white' : 'text-zinc-600'}` 
             }, t.label)
           );
         })
@@ -2258,6 +3454,509 @@ const GoalModal = ({ data, onClose, onSave }) => {
         e(Icon, { d: icons.check, size: 18, stroke: "black" }),
         "Save"
       )
+    )
+  );
+};
+
+const ScheduleModal = ({ data, onClose, onSave }) => {
+  const [schedule, setSchedule] = uS({ ...data.workoutSchedule });
+  
+  const days = [
+    { idx: 1, label: 'Monday' },
+    { idx: 2, label: 'Tuesday' },
+    { idx: 3, label: 'Wednesday' },
+    { idx: 4, label: 'Thursday' },
+    { idx: 5, label: 'Friday' },
+    { idx: 6, label: 'Saturday' },
+    { idx: 0, label: 'Sunday' },
+  ];
+  
+  const setDay = (dayIdx, value) => {
+    setSchedule(prev => ({ ...prev, [dayIdx]: value }));
+  };
+  
+  const workoutCount = Object.values(schedule).filter(v => v === 'workout').length;
+  
+  return e(Modal, { onClose, title: "Weekly schedule" },
+    e('p', { className: "text-zinc-500 text-sm mb-5" }, 
+      "Set your training and rest days. Helps track if you're hitting your weekly goals."
+    ),
+    
+    e('div', { className: "space-y-2 mb-4" },
+      days.map(d => 
+        e('div', { key: d.idx, className: "bg-zinc-800 rounded-xl p-3" },
+          e('div', { className: "flex justify-between items-center mb-2" },
+            e('span', { className: "text-white font-display font-semibold text-sm" }, d.label),
+            e('span', { 
+              className: `text-[10px] font-mono-d uppercase ${
+                schedule[d.idx] === 'workout' ? 'text-emerald-400' :
+                schedule[d.idx] === 'rest' ? 'text-zinc-500' : 'text-zinc-600'
+              }`
+            }, schedule[d.idx] === 'workout' ? '💪 train' : schedule[d.idx] === 'rest' ? '💤 rest' : 'unset')
+          ),
+          e('div', { className: "grid grid-cols-3 gap-1.5" },
+            e('button', { 
+              onClick: () => setDay(d.idx, 'workout'),
+              className: `rounded-lg py-2 text-xs font-display font-semibold ${schedule[d.idx] === 'workout' ? 'bg-emerald-400 text-black' : 'bg-zinc-900 text-zinc-400'}`
+            }, "Train"),
+            e('button', { 
+              onClick: () => setDay(d.idx, 'rest'),
+              className: `rounded-lg py-2 text-xs font-display font-semibold ${schedule[d.idx] === 'rest' ? 'bg-zinc-600 text-white' : 'bg-zinc-900 text-zinc-400'}`
+            }, "Rest"),
+            e('button', { 
+              onClick: () => setDay(d.idx, null),
+              className: `rounded-lg py-2 text-xs font-display font-semibold ${schedule[d.idx] === null || schedule[d.idx] === undefined ? 'bg-zinc-700 text-zinc-400' : 'bg-zinc-900 text-zinc-500'}`
+            }, "Flex")
+          )
+        )
+      )
+    ),
+    
+    e('div', { className: "bg-emerald-500/10 border border-emerald-500/20 rounded-xl p-3 mb-4 text-center" },
+      e('p', { className: "text-emerald-300 font-display font-bold" }, 
+        `${workoutCount} training day${workoutCount !== 1 ? 's' : ''} per week`
+      )
+    ),
+    
+    e('div', { className: "flex gap-3" },
+      e('button', { 
+        onClick: onClose,
+        className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+      }, "Cancel"),
+      e('button', { 
+        onClick: () => onSave(schedule),
+        className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
+      },
+        e(Icon, { d: icons.check, size: 18, stroke: "black" }),
+        "Save"
+      )
+    )
+  );
+};
+
+const PhotoAddModal = ({ data, onClose, onSaved }) => {
+  const [file, setFile] = uS(null);
+  const [preview, setPreview] = uS(null);
+  const [angle, setAngle] = uS('front');
+  const [notes, setNotes] = uS("");
+  const [includeWeight, setIncludeWeight] = uS(true);
+  const [saving, setSaving] = uS(false);
+  const [error, setError] = uS(null);
+  const photoInputRef = uR(null);
+  
+  uE(() => {
+    if (!file) { setPreview(null); return; }
+    const url = URL.createObjectURL(file);
+    setPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
+  
+  const handleSave = async () => {
+    if (!file) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await photoStore.add(file, {
+        weight: includeWeight ? data.bodyWeight : null,
+        notes,
+        angle,
+      });
+      onSaved();
+    } catch (err) {
+      setError(err.message || "Failed to save photo");
+      setSaving(false);
+    }
+  };
+  
+  return e(Modal, { onClose, title: "Add progress photo" },
+    e('input', {
+      ref: photoInputRef,
+      type: "file",
+      accept: "image/*",
+      onChange: (ev) => setFile(ev.target.files?.[0] || null),
+      style: { display: 'none' }
+    }),
+    
+    !preview ? 
+      e('div', null,
+        e('p', { className: "text-zinc-500 text-sm mb-4" }, 
+          "Take a photo or select one from your library. Photos are stored only on this device."
+        ),
+        e('button', { 
+          onClick: () => photoInputRef.current?.click(),
+          className: "w-full bg-gradient-to-br from-purple-500/20 to-pink-500/10 border border-purple-500/30 rounded-2xl p-8 active:scale-[0.98] transition mb-3"
+        },
+          e('div', { className: "text-5xl mb-2" }, "📸"),
+          e('p', { className: "text-white font-display font-bold mb-1" }, "Choose photo"),
+          e('p', { className: "text-zinc-400 text-xs" }, "From camera or library")
+        )
+      ) :
+      e('div', null,
+        // Preview
+        e('div', { className: "relative bg-zinc-800 rounded-2xl overflow-hidden mb-4" },
+          e('img', { 
+            src: preview, 
+            className: "w-full max-h-72 object-contain"
+          }),
+          e('button', { 
+            onClick: () => setFile(null),
+            className: "absolute top-2 right-2 w-8 h-8 rounded-full bg-black/70 backdrop-blur flex items-center justify-center"
+          }, e(Icon, { d: icons.x, size: 16, className: "text-white" }))
+        ),
+        
+        // Angle selector
+        e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, "Angle"),
+        e('div', { className: "grid grid-cols-3 gap-2 mb-4" },
+          [
+            { v: 'front', emoji: '🧍', label: 'Front' },
+            { v: 'side', emoji: '🚶', label: 'Side' },
+            { v: 'back', emoji: '🧍‍♂️', label: 'Back' },
+          ].map(opt => 
+            e('button', { 
+              key: opt.v,
+              onClick: () => setAngle(opt.v),
+              className: `rounded-xl py-2.5 px-2 font-display font-semibold flex flex-col items-center gap-1 ${angle === opt.v ? 'bg-purple-400 text-black' : 'bg-zinc-800 text-white'}`
+            },
+              e('span', { className: "text-xl" }, opt.emoji),
+              e('span', { className: "text-xs" }, opt.label)
+            )
+          )
+        ),
+        
+        // Weight checkbox
+        e('button', { 
+          onClick: () => setIncludeWeight(!includeWeight),
+          className: "w-full bg-zinc-800 rounded-xl px-4 py-3 mb-3 flex items-center gap-3 active:scale-[0.98]"
+        },
+          e('div', { className: `w-5 h-5 rounded-md flex items-center justify-center ${includeWeight ? 'bg-emerald-400' : 'bg-zinc-700 border border-zinc-600'}` },
+            includeWeight && e(Icon, { d: icons.check, size: 14, stroke: "black" })
+          ),
+          e('span', { className: "text-white text-sm font-display flex-1 text-left" }, 
+            `Tag with current weight (${data.bodyWeight}kg)`
+          )
+        ),
+        
+        // Notes
+        e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, "Notes (optional)"),
+        e('input', {
+          value: notes,
+          onChange: (ev) => setNotes(ev.target.value),
+          placeholder: "feeling lean, post-workout, etc.",
+          className: "w-full bg-zinc-800 text-white rounded-xl px-4 py-3 mb-4 placeholder-zinc-500 outline-none focus:ring-2 focus:ring-purple-400 text-sm"
+        }),
+        
+        error && e('div', { className: "bg-rose-500/10 border border-rose-500/30 rounded-xl p-3 mb-3" },
+          e('p', { className: "text-rose-300 text-xs" }, error)
+        ),
+        
+        e('div', { className: "flex gap-3" },
+          e('button', { 
+            onClick: onClose,
+            disabled: saving,
+            className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+          }, "Cancel"),
+          e('button', { 
+            onClick: handleSave,
+            disabled: saving,
+            className: `flex-1 rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2 ${saving ? 'bg-zinc-700 text-zinc-500' : 'bg-purple-400 text-black'}`
+          },
+            saving ? "Saving..." : (e(React.Fragment, null,
+              e(Icon, { d: icons.check, size: 18, stroke: "black" }),
+              "Save photo"
+            ))
+          )
+        )
+      )
+  );
+};
+
+const PhotoViewerModal = ({ photo, onClose, onDelete }) => {
+  const [imgUrl, setImgUrl] = uS(null);
+  
+  uE(() => {
+    const url = URL.createObjectURL(photo.blob);
+    setImgUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [photo.id]);
+  
+  const dateStr = new Date(photo.dateISO).toLocaleDateString('en-US', { 
+    weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' 
+  });
+  
+  return e('div', { 
+    className: "fixed inset-0 bg-black z-50 flex flex-col",
+    onClick: onClose
+  },
+    // Top bar
+    e('div', { 
+      className: "flex justify-between items-center p-4 pt-safe bg-black/90 backdrop-blur",
+      onClick: (ev) => ev.stopPropagation()
+    },
+      e('button', { 
+        onClick: onClose,
+        className: "w-10 h-10 rounded-full bg-zinc-800 flex items-center justify-center"
+      }, e(Icon, { d: icons.x, size: 18, className: "text-white" })),
+      e('p', { className: "text-white font-display font-semibold text-sm" }, 
+        new Date(photo.dateISO).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+      ),
+      e('button', { 
+        onClick: () => { 
+          if (confirm("Delete this photo?")) onDelete(); 
+        },
+        className: "w-10 h-10 rounded-full bg-rose-500/20 flex items-center justify-center"
+      }, e(Icon, { d: icons.trash, size: 16, className: "text-rose-400" }))
+    ),
+    
+    // Image
+    imgUrl && e('div', { 
+      className: "flex-1 flex items-center justify-center p-4",
+      onClick: (ev) => ev.stopPropagation()
+    },
+      e('img', { 
+        src: imgUrl,
+        className: "max-w-full max-h-full object-contain rounded-2xl"
+      })
+    ),
+    
+    // Info bar
+    e('div', { 
+      className: "p-4 pb-safe bg-zinc-900/95 backdrop-blur border-t border-white/5",
+      onClick: (ev) => ev.stopPropagation()
+    },
+      e('div', { className: "flex items-center gap-4 mb-2" },
+        e('span', { className: "text-2xl" }, 
+          photo.angle === 'side' ? '🚶' : photo.angle === 'back' ? '🧍‍♂️' : '🧍'
+        ),
+        e('div', { className: "flex-1" },
+          e('p', { className: "text-white font-display font-semibold text-sm" }, dateStr),
+          photo.weight && e('p', { className: "text-purple-300 text-xs font-mono-d" }, 
+            `${photo.weight}kg · ${photo.angle} angle`
+          )
+        )
+      ),
+      photo.notes && e('p', { className: "text-zinc-400 text-xs italic" }, `"${photo.notes}"`)
+    )
+  );
+};
+
+const TrainingSettingsModal = ({ data, onClose, onSave }) => {
+  const [selected, setSelected] = uS(data.trainingGoal || "progressive_overload");
+  const goalConfig = TRAINING_GOALS[selected];
+  
+  return e(Modal, { onClose, title: "Training settings" },
+    e('p', { className: "text-zinc-500 text-sm mb-5 leading-snug" }, 
+      "Pick your training goal. The app will suggest weight/rep targets after each workout based on this."
+    ),
+    
+    e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, "Training goal"),
+    e('div', { className: "space-y-2 mb-5" },
+      Object.entries(TRAINING_GOALS).map(([key, g]) => 
+        e('button', { 
+          key,
+          onClick: () => setSelected(key),
+          className: `w-full rounded-2xl p-4 text-left transition active:scale-[0.98] ${
+            selected === key 
+              ? 'bg-emerald-500/15 border-2 border-emerald-400' 
+              : 'bg-zinc-800 border-2 border-transparent'
+          }`
+        },
+          e('div', { className: "flex items-center gap-3" },
+            e('span', { className: "text-2xl" }, g.emoji),
+            e('div', { className: "flex-1" },
+              e('p', { className: "text-white font-display font-semibold text-sm" }, g.label),
+              e('p', { className: "text-zinc-500 text-xs leading-snug" }, g.desc)
+            ),
+            e('div', { className: "text-right" },
+              e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Reps"),
+              e('p', { 
+                className: `text-sm font-mono-d font-bold ${selected === key ? 'text-emerald-300' : 'text-zinc-400'}` 
+              }, `${g.repMin}-${g.repMax}`)
+            )
+          )
+        )
+      )
+    ),
+    
+    // Detailed explanation of selected
+    e('div', { className: "bg-zinc-800 rounded-2xl p-4 mb-5" },
+      e('div', { className: "flex items-center gap-2 mb-2" },
+        e('span', { className: "text-base" }, goalConfig.emoji),
+        e('p', { className: "text-white font-display font-semibold text-sm" }, 
+          `How ${goalConfig.label.toLowerCase()} works`
+        )
+      ),
+      e('p', { className: "text-zinc-400 text-xs leading-snug mb-3" }, goalConfig.description),
+      e('div', { className: "grid grid-cols-2 gap-3 pt-3 border-t border-white/5" },
+        e('div', null,
+          e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Rep range"),
+          e('p', { className: "text-white font-display font-bold" }, `${goalConfig.repMin}-${goalConfig.repMax}`)
+        ),
+        e('div', null,
+          e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Weight jump"),
+          e('p', { className: "text-white font-display font-bold" }, 
+            goalConfig.weightIncrement > 0 ? `+${goalConfig.weightIncrement}kg` : "—"
+          )
+        )
+      )
+    ),
+    
+    // Example
+    selected !== "maintain" && e('div', { className: "bg-emerald-500/5 border border-emerald-500/20 rounded-2xl p-4 mb-5" },
+      e('p', { className: "text-[10px] text-emerald-400 font-mono-d uppercase mb-2" }, "Example"),
+      e('p', { className: "text-zinc-300 text-xs leading-snug" }, 
+        `If you bench 40kg × ${goalConfig.repMax} this session, the app suggests ${40 + goalConfig.weightIncrement}kg × ${goalConfig.repMin} next time. If you got ${goalConfig.repMin + 1} reps, it'll suggest +1 rep at the same weight.`
+      )
+    ),
+    
+    e('div', { className: "flex gap-3" },
+      e('button', { 
+        onClick: onClose,
+        className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+      }, "Cancel"),
+      e('button', { 
+        onClick: () => onSave(selected),
+        className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
+      },
+        e(Icon, { d: icons.check, size: 18, stroke: "black" }),
+        "Save"
+      )
+    )
+  );
+};
+
+const BackupModal = ({ data, onClose, onImported }) => {
+  const [exporting, setExporting] = uS(false);
+  const [importing, setImporting] = uS(false);
+  const [error, setError] = uS(null);
+  const [success, setSuccess] = uS(null);
+  const [confirmReplace, setConfirmReplace] = uS(false);
+  const fileInputRef = uR(null);
+  
+  const lastBackup = data.lastBackupISO ? 
+    new Date(data.lastBackupISO).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) :
+    "never";
+  
+  const handleExport = async () => {
+    setExporting(true);
+    setError(null);
+    try {
+      await downloadBackup();
+      setSuccess("Backup downloaded! Save it to iCloud Drive or email it to yourself.");
+    } catch (err) {
+      setError("Export failed: " + (err.message || "unknown"));
+    } finally {
+      setExporting(false);
+    }
+  };
+  
+  const handleImport = async (file) => {
+    if (!file) return;
+    if (!confirmReplace) {
+      setError("Please confirm — importing will replace ALL current data.");
+      return;
+    }
+    setImporting(true);
+    setError(null);
+    try {
+      const result = await importBackup(file);
+      setSuccess(`Restored! ${result.photoCount} photos. App will reload...`);
+      setTimeout(() => onImported(), 1500);
+    } catch (err) {
+      setError("Import failed: " + (err.message || "Invalid backup file"));
+      setImporting(false);
+    }
+  };
+  
+  return e(Modal, { onClose, title: "Backup & restore" },
+    e('p', { className: "text-zinc-500 text-sm mb-5 leading-snug" }, 
+      "Your data is stored only on this phone. Back up regularly to avoid losing it if Safari clears site data."
+    ),
+    
+    // Status
+    e('div', { className: "bg-zinc-800 rounded-2xl p-4 mb-4" },
+      e('div', { className: "flex justify-between items-center mb-2" },
+        e('span', { className: "text-[10px] text-zinc-500 font-mono-d uppercase" }, "Last backup"),
+        e('span', { className: `text-xs font-display font-semibold ${data.lastBackupISO ? 'text-emerald-400' : 'text-orange-400'}` }, 
+          lastBackup
+        )
+      ),
+      e('div', { className: "flex justify-between items-center" },
+        e('span', { className: "text-[10px] text-zinc-500 font-mono-d uppercase" }, "Data"),
+        e('span', { className: "text-xs text-zinc-300 font-mono-d" }, 
+          `${(data.workoutHistory || []).length} workouts · ${data.weightHistory.length} weights · ${(data.savedMeals || []).length} fav meals`
+        )
+      )
+    ),
+    
+    // EXPORT
+    e('h3', { className: "text-white font-display font-semibold mb-2 flex items-center gap-2" },
+      e('span', null, "📦"),
+      "Export data"
+    ),
+    e('p', { className: "text-zinc-500 text-xs mb-3 leading-snug" }, 
+      "Downloads a JSON file with all meals, workouts, weight history, settings, and photos. Save it to iCloud Drive for safekeeping."
+    ),
+    e('button', { 
+      onClick: handleExport,
+      disabled: exporting,
+      className: `w-full bg-gradient-to-r from-emerald-400 to-cyan-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2 mb-5 ${exporting ? 'opacity-60' : 'active:scale-[0.98]'}`
+    },
+      exporting ? "Preparing backup..." : (
+        e(React.Fragment, null,
+          e(Icon, { d: icons.target, size: 18, stroke: "black" }),
+          "Download backup"
+        )
+      )
+    ),
+    
+    // IMPORT
+    e('h3', { className: "text-white font-display font-semibold mb-2 flex items-center gap-2" },
+      e('span', null, "♻️"),
+      "Restore from backup"
+    ),
+    e('p', { className: "text-zinc-500 text-xs mb-3 leading-snug" }, 
+      "Replaces ALL current data with backup contents. Use this on a new device or after Safari cleared your data."
+    ),
+    
+    // Confirmation checkbox
+    e('button', { 
+      onClick: () => setConfirmReplace(!confirmReplace),
+      className: "w-full bg-zinc-800 rounded-xl px-4 py-3 mb-3 flex items-center gap-3 active:scale-[0.98]"
+    },
+      e('div', { className: `w-5 h-5 rounded-md flex items-center justify-center ${confirmReplace ? 'bg-rose-400' : 'bg-zinc-700 border border-zinc-600'}` },
+        confirmReplace && e(Icon, { d: icons.check, size: 14, stroke: "black" })
+      ),
+      e('span', { className: "text-white text-xs font-display flex-1 text-left" }, 
+        "I understand this will replace all my current data"
+      )
+    ),
+    
+    e('input', {
+      ref: fileInputRef,
+      type: "file",
+      accept: "application/json,.json",
+      onChange: (ev) => handleImport(ev.target.files?.[0]),
+      style: { display: 'none' }
+    }),
+    
+    e('button', { 
+      onClick: () => fileInputRef.current?.click(),
+      disabled: !confirmReplace || importing,
+      className: `w-full rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2 mb-4 ${confirmReplace && !importing ? 'bg-rose-500/20 text-rose-300 active:scale-[0.98]' : 'bg-zinc-800 text-zinc-600'}`
+    },
+      importing ? "Restoring..." : "Choose backup file"
+    ),
+    
+    error && e('div', { className: "bg-rose-500/10 border border-rose-500/30 rounded-xl p-3 mb-3" },
+      e('p', { className: "text-rose-300 text-xs" }, error)
+    ),
+    
+    success && e('div', { className: "bg-emerald-500/10 border border-emerald-500/30 rounded-xl p-3 mb-3" },
+      e('p', { className: "text-emerald-300 text-xs" }, success)
+    ),
+    
+    e('p', { className: "text-[10px] text-zinc-600 leading-snug" }, 
+      "Tip: Safari on iOS may clear site data after 7 days of inactivity. Open the app every few days OR back up weekly to be safe."
     )
   );
 };
@@ -2919,9 +4618,16 @@ const EditMealModal = ({ meal, onClose, onSave, onDelete }) => {
   );
 };
 
-const EditWorkoutModal = ({ workout, bodyWeight, onClose, onSave, onDelete }) => {
+const EditWorkoutModal = ({ workout, bodyWeight, workoutHistory, trainingGoal, onClose, onSave, onDelete }) => {
   const [w, setW] = uS(JSON.parse(JSON.stringify(workout)));
   const [kcalEdited, setKcalEdited] = uS(false);
+  const [showSuggestions, setShowSuggestions] = uS(true);
+  
+  // Compute progressive overload suggestions
+  const suggestions = generateWorkoutSuggestions(w, workoutHistory || [], trainingGoal || "progressive_overload");
+  const suggestionMap = {};
+  suggestions.forEach(s => { suggestionMap[s.exerciseName.toLowerCase()] = s; });
+  const goalConfig = TRAINING_GOALS[trainingGoal] || TRAINING_GOALS.progressive_overload;
   
   // Recompute total volume
   const recalcVolume = (workout) => {
@@ -3016,22 +4722,59 @@ const EditWorkoutModal = ({ workout, bodyWeight, onClose, onSave, onDelete }) =>
       className: "w-full bg-zinc-800 text-zinc-400 rounded-xl py-2 font-mono-d text-xs uppercase mb-4"
     }, "Reset to auto"),
     
+    // Suggestions toggle (if any suggestions to show)
+    suggestions.length > 0 && e('div', { className: "bg-gradient-to-br from-emerald-500/10 to-cyan-500/5 border border-emerald-500/20 rounded-xl p-3 mb-3" },
+      e('div', { className: "flex justify-between items-center" },
+        e('div', { className: "flex items-center gap-2" },
+          e('span', { className: "text-base" }, goalConfig.emoji),
+          e('div', null,
+            e('p', { className: "text-emerald-300 font-display font-semibold text-xs" }, 
+              `${goalConfig.label} suggestions`
+            ),
+            e('p', { className: "text-zinc-500 text-[10px] font-mono-d" }, 
+              `Target ${goalConfig.repMin}-${goalConfig.repMax} reps`
+            )
+          )
+        ),
+        e('button', { 
+          onClick: () => setShowSuggestions(!showSuggestions),
+          className: "text-emerald-400 text-[10px] font-mono-d uppercase active:scale-95"
+        }, showSuggestions ? "hide" : "show")
+      )
+    ),
+    
     // Exercises
     e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase mb-2" }, "Exercises"),
     e('div', { className: "space-y-3 mb-4 max-h-96 overflow-y-auto scrollbar-hide" },
-      w.exercises.map((ex, exIdx) => e('div', { key: exIdx, className: "bg-zinc-800 rounded-xl p-3" },
+      w.exercises.map((ex, exIdx) => {
+        const exSuggestion = suggestionMap[ex.name.toLowerCase()];
+        return e('div', { key: exIdx, className: "bg-zinc-800 rounded-xl p-3" },
         e('div', { className: "flex justify-between items-start mb-2" },
-          e('p', { className: "text-white font-display font-semibold text-sm flex-1" }, ex.name),
+          e('div', { className: "flex-1" },
+            e('p', { className: "text-white font-display font-semibold text-sm" }, ex.name),
+            // Show "first time tracked" or "vs last session" badge
+            exSuggestion && exSuggestion.hasPrevious && exSuggestion.previousDate &&
+              e('p', { className: "text-[9px] text-zinc-500 font-mono-d" }, 
+                `vs ${new Date(exSuggestion.previousDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
+              ),
+            exSuggestion && !exSuggestion.hasPrevious &&
+              e('p', { className: "text-[9px] text-emerald-400 font-mono-d uppercase" }, 
+                "🎯 first time tracked"
+              )
+          ),
           e('button', { 
             onClick: () => removeExercise(exIdx),
             className: "text-rose-400 p-1"
           }, e(Icon, { d: icons.trash, size: 14 }))
         ),
         e('div', { className: "space-y-1.5" },
-          ex.sets.map((s, setIdx) => e('div', { 
-            key: setIdx, 
-            className: "flex items-center gap-2 bg-zinc-900 rounded-lg p-2"
-          },
+          ex.sets.map((s, setIdx) => {
+            const setSugg = exSuggestion?.sets?.find(ss => ss.setNum === (s.set || setIdx + 1)) || 
+                           exSuggestion?.sets?.[setIdx];
+            return e('div', { key: setIdx, className: "space-y-1" },
+              e('div', { 
+                className: "flex items-center gap-2 bg-zinc-900 rounded-lg p-2"
+              },
             e('span', { className: "text-zinc-500 text-xs font-mono-d w-4" }, s.set || setIdx + 1),
             // StairMaster set
             ex.type === "stairmaster" || s.level !== undefined && s.duration !== undefined ?
@@ -3103,9 +4846,31 @@ const EditWorkoutModal = ({ workout, bodyWeight, onClose, onSave, onDelete }) =>
               onClick: () => removeSet(exIdx, setIdx),
               className: "text-zinc-500 p-1 active:text-rose-400"
             }, e(Icon, { d: icons.x, size: 12 }))
-          ))
+              ),
+              // Per-set suggestion (only for strength sets with weight & reps)
+              showSuggestions && setSugg && setSugg.suggestion && s.weight && s.reps && e('div', { 
+                className: `flex items-center gap-2 ml-6 px-2 py-1.5 rounded-md text-[10px] ${
+                  setSugg.suggestion.status === 'level_up' ? 'bg-emerald-500/10 text-emerald-300' :
+                  setSugg.suggestion.status === 'build_reps' ? 'bg-cyan-500/10 text-cyan-300' :
+                  setSugg.suggestion.status === 'maintain' ? 'bg-zinc-700/50 text-zinc-400' :
+                  'bg-zinc-700/50 text-zinc-400'
+                }`
+              },
+                e('span', null, setSugg.suggestion.icon),
+                e('span', { className: "font-mono-d" }, "next:"),
+                e('span', { className: "font-display font-bold" }, 
+                  `${setSugg.suggestion.suggestedWeight}kg × ${setSugg.suggestion.suggestedReps}`
+                ),
+                setSugg.comparedToPrev && setSugg.comparedToPrev.improved &&
+                  e('span', { className: "text-emerald-400 ml-auto" }, 
+                    `+${setSugg.comparedToPrev.volDelta} vol`
+                  )
+              )
+            );
+          })
         )
-      ))
+      );
+      })
     ),
     
     e('div', { className: "flex gap-3" },
@@ -3130,9 +4895,31 @@ const EditWorkoutModal = ({ workout, bodyWeight, onClose, onSave, onDelete }) =>
   );
 };
 
-const ImportResultModal = ({ result, onConfirm, onCancel, bodyWeight }) => 
-  e('div', { className: "fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-end" },
-    e('div', { className: "w-full bg-zinc-900 rounded-t-3xl p-6 border-t border-white/10 max-h-[85vh] overflow-y-auto scrollbar-hide slide-up pb-safe" },
+const ImportResultModal = ({ result, onConfirm, onCancel, bodyWeight }) => {
+  // Default to today
+  const todayISO = new Date().toISOString().slice(0, 10);
+  const [selectedDate, setSelectedDate] = uS(todayISO);
+  const [showDatePicker, setShowDatePicker] = uS(false);
+  
+  const isToday = selectedDate === todayISO;
+  const dateLabel = isToday ? "Today" : new Date(selectedDate).toLocaleDateString('en-US', { 
+    weekday: 'short', month: 'short', day: 'numeric', year: 'numeric'
+  });
+  
+  // Generate quick-pick dates (today, yesterday, 2-7 days ago)
+  const quickDates = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    quickDates.push({
+      iso: d.toISOString().slice(0, 10),
+      label: i === 0 ? "Today" : i === 1 ? "Yesterday" : d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+      day: d.toLocaleDateString('en-US', { weekday: 'short' }),
+    });
+  }
+  
+  return e('div', { className: "fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-end" },
+    e('div', { className: "w-full bg-zinc-900 rounded-t-3xl p-6 border-t border-white/10 max-h-[90vh] overflow-y-auto scrollbar-hide slide-up pb-safe" },
       e('div', { className: "w-10 h-1 bg-zinc-700 rounded-full mx-auto mb-5" }),
       e('div', { className: "flex items-center gap-2 mb-1" },
         e('div', { className: "w-8 h-8 rounded-full bg-emerald-500/20 flex items-center justify-center" },
@@ -3142,6 +4929,38 @@ const ImportResultModal = ({ result, onConfirm, onCancel, bodyWeight }) =>
       ),
       e('p', { className: "text-zinc-500 text-xs font-mono-d mb-5 uppercase" }, 
         `${result.exercises.length} exercises · ${result.exercises.reduce((s, ex) => s + ex.sets.length, 0)} sets`
+      ),
+      
+      // DATE PICKER — new
+      e('div', { className: `rounded-2xl p-4 mb-3 border ${isToday ? 'bg-zinc-800 border-white/5' : 'bg-purple-500/10 border-purple-500/30'}` },
+        e('div', { className: "flex justify-between items-center mb-2" },
+          e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase flex items-center gap-1" }, 
+            e(Icon, { d: icons.clock, size: 10 }),
+            "Workout date"
+          ),
+          !isToday && e('span', { className: "text-[9px] bg-purple-500/30 text-purple-300 px-1.5 py-0.5 rounded font-mono-d uppercase" }, "backdated")
+        ),
+        e('p', { className: "text-white font-display font-bold text-base mb-3" }, dateLabel),
+        // Quick date chips
+        e('div', { className: "flex gap-1.5 overflow-x-auto scrollbar-hide -mx-1 px-1 mb-2" },
+          quickDates.map(d => e('button', {
+            key: d.iso,
+            onClick: () => setSelectedDate(d.iso),
+            className: `flex-shrink-0 rounded-lg px-3 py-1.5 text-[10px] font-mono-d uppercase ${selectedDate === d.iso ? 'bg-emerald-400 text-black' : 'bg-zinc-900 text-zinc-400'}`
+          }, d.label))
+        ),
+        // Native date input for older dates
+        e('button', {
+          onClick: () => setShowDatePicker(!showDatePicker),
+          className: "text-[10px] text-zinc-400 font-mono-d uppercase active:scale-95"
+        }, showDatePicker ? "− pick exact date" : "+ pick exact date"),
+        showDatePicker && e('input', {
+          type: "date",
+          value: selectedDate,
+          max: todayISO, // can't backdate to future
+          onChange: (ev) => setSelectedDate(ev.target.value),
+          className: "w-full mt-2 bg-zinc-900 text-white rounded-lg px-3 py-2 text-sm font-mono-d outline-none focus:ring-2 focus:ring-emerald-400"
+        })
       ),
       
       e('div', { className: "bg-zinc-800 rounded-2xl p-4 mb-3" },
@@ -3201,15 +5020,16 @@ const ImportResultModal = ({ result, onConfirm, onCancel, bodyWeight }) =>
           className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
         }, "Cancel"),
         e('button', { 
-          onClick: onConfirm,
-          className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
+          onClick: () => onConfirm(isToday ? null : selectedDate),
+          className: `flex-1 rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2 ${isToday ? 'bg-emerald-400 text-black' : 'bg-purple-400 text-black'}`
         },
           e(Icon, { d: icons.check, size: 18, stroke: "black" }),
-          "Add to today"
+          isToday ? "Add to today" : "Add to " + new Date(selectedDate).toLocaleDateString('en-US', { weekday: 'short' })
         )
       )
     )
   );
+};
 
 // ============ WEIGHT CHART ============
 const renderWeightChart = (data, weightToGoal, weightLost) => {
@@ -3267,6 +5087,508 @@ const renderWeightChart = (data, weightToGoal, weightLost) => {
         e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "To goal"),
         e('p', { className: "text-purple-400 font-display font-bold" }, `-${weightToGoal}kg`)
       )
+    )
+  );
+};
+
+// ============ SLEEP CHART ============
+const renderSleepChart = (sleepData) => {
+  // Show last 14 nights
+  const recent = sleepData.slice(-14);
+  const avg = recent.reduce((s, d) => s + d.hours, 0) / recent.length;
+  const last7 = recent.slice(-7);
+  const prev7 = recent.slice(-14, -7);
+  const last7Avg = last7.length > 0 ? last7.reduce((s, d) => s + d.hours, 0) / last7.length : 0;
+  const prev7Avg = prev7.length > 0 ? prev7.reduce((s, d) => s + d.hours, 0) / prev7.length : 0;
+  const trend = prev7.length >= 3 ? (last7Avg - prev7Avg) : 0;
+  
+  // Bar chart
+  const maxHours = 10;
+  const goalHours = 8;
+  
+  return e('div', null,
+    e('div', { className: "relative h-32 flex items-end gap-1 mt-4" },
+      // Goal line
+      e('div', { 
+        className: "absolute inset-x-0 border-t border-dashed border-emerald-400/30",
+        style: { top: `${((maxHours - goalHours) / maxHours) * 100}%` }
+      },
+        e('span', { className: "absolute -top-2 right-0 text-[9px] font-mono-d bg-emerald-400/20 text-emerald-300 px-1.5 py-0.5 rounded" }, 
+          "8h"
+        )
+      ),
+      recent.map((d, i) => {
+        const heightPct = (d.hours / maxHours) * 100;
+        const isLow = d.hours < 6;
+        const isGood = d.hours >= 7.5;
+        const colorClass = isLow ? "bg-rose-400/70" : isGood ? "bg-indigo-400" : "bg-indigo-500/50";
+        return e('div', { 
+          key: i,
+          className: "flex-1 flex flex-col items-center justify-end h-full"
+        },
+          e('div', { 
+            className: `w-full rounded-t-md ${colorClass}`,
+            style: { height: `${heightPct}%`, minHeight: '4px' }
+          })
+        );
+      })
+    ),
+    // Day labels (just first/middle/last)
+    recent.length >= 3 && e('div', { className: "flex justify-between mt-2" },
+      e('span', { className: "text-[9px] text-zinc-600 font-mono-d" }, 
+        new Date(recent[0].dateISO).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+      ),
+      e('span', { className: "text-[9px] text-zinc-600 font-mono-d" }, 
+        new Date(recent[recent.length - 1].dateISO).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+      )
+    ),
+    e('div', { className: "grid grid-cols-3 gap-2 mt-5 pt-4 border-t border-white/5" },
+      e('div', null,
+        e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Avg"),
+        e('p', { className: "text-white font-display font-bold" }, `${avg.toFixed(1)}h`)
+      ),
+      e('div', null,
+        e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Last 7d"),
+        e('p', { className: "text-indigo-400 font-display font-bold" }, 
+          last7.length > 0 ? `${last7Avg.toFixed(1)}h` : "—"
+        )
+      ),
+      e('div', null,
+        e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Trend"),
+        e('p', { className: `font-display font-bold ${trend > 0.2 ? 'text-emerald-400' : trend < -0.2 ? 'text-rose-400' : 'text-zinc-400'}` }, 
+          prev7.length >= 3 ? 
+            `${trend > 0 ? '+' : ''}${trend.toFixed(1)}h` : 
+            "—"
+        )
+      )
+    )
+  );
+};
+
+// ============ WHAT IF TAB COMPONENT ============
+const WhatIfTab = ({ data, totalEaten, totalBurned, tdee, balance, goalRange }) => {
+  const [extraEat, setExtraEat] = uS(0);
+  const [extraBurn, setExtraBurn] = uS(0);
+  const [extraSteps, setExtraSteps] = uS(0);
+  
+  // Steps burn ~0.04 kcal per step for 75kg person, scale with weight
+  const stepsBurn = Math.round(extraSteps * 0.04 * (data.bodyWeight / 75));
+  
+  // Calculate adjusted balance
+  const newEaten = totalEaten + parseInt(extraEat || 0);
+  const newBurned = totalBurned + parseInt(extraBurn || 0) + stepsBurn;
+  const newBalance = newEaten - tdee - newBurned;
+  
+  const isOnTrack = newBalance >= goalRange.min && newBalance <= goalRange.max;
+  const isTooAggressive = data.goalType === "cut" ? newBalance < goalRange.min : newBalance > goalRange.max;
+  
+  // Generate suggestions to get back on track
+  const generateOffTrackSuggestions = () => {
+    const suggestions = [];
+    
+    if (data.goalType === "cut") {
+      // Need a deficit between -750 and -300
+      if (newBalance > goalRange.max) {
+        // Not enough deficit — need to burn more or eat less
+        const gap = newBalance - goalRange.target; // how much surplus to remove
+        suggestions.push({
+          emoji: "🚶",
+          title: `Walk ${Math.ceil(gap / 5)} minutes`,
+          detail: `A brisk walk burns ~5 kcal/min. ${Math.ceil(gap / 5)} min = ~${Math.ceil(gap / 5) * 5} kcal`,
+          action: () => setExtraBurn(parseInt(extraBurn || 0) + Math.ceil(gap / 5) * 5)
+        });
+        suggestions.push({
+          emoji: "🪜",
+          title: `StairMaster +${Math.ceil(gap / 12)} min`,
+          detail: `StairMaster level 8-9 burns ~12 kcal/min. Adds ~${Math.ceil(gap / 12) * 12} kcal burn`,
+          action: () => setExtraBurn(parseInt(extraBurn || 0) + Math.ceil(gap / 12) * 12)
+        });
+        suggestions.push({
+          emoji: "🍽️",
+          title: `Eat ${Math.round(gap)} fewer kcal today`,
+          detail: `Skip a snack or reduce portion sizes to close the gap`,
+          action: () => setExtraEat(parseInt(extraEat || 0) - Math.round(gap))
+        });
+      } else if (newBalance < goalRange.min) {
+        // Deficit too aggressive
+        const needed = goalRange.min - newBalance;
+        suggestions.push({
+          emoji: "🥜",
+          title: `Add ${Math.round(Math.abs(needed))} kcal`,
+          detail: `Deficit is risky — eat more protein or carbs`,
+          action: () => setExtraEat(parseInt(extraEat || 0) + Math.round(Math.abs(needed)))
+        });
+      }
+    } else if (data.goalType === "bulk") {
+      if (newBalance < goalRange.min) {
+        const needed = goalRange.target - newBalance;
+        suggestions.push({
+          emoji: "🍚",
+          title: `Eat ${Math.round(needed)} more kcal`,
+          detail: `Add carbs + protein to hit your bulk target`,
+          action: () => setExtraEat(parseInt(extraEat || 0) + Math.round(needed))
+        });
+      } else if (newBalance > goalRange.max) {
+        const surplus = newBalance - goalRange.target;
+        suggestions.push({
+          emoji: "🚶",
+          title: `Walk ${Math.ceil(surplus / 5)} min to lean bulk`,
+          detail: `Surplus too high — risks fat gain. Burn ~${Math.ceil(surplus / 5) * 5} kcal`,
+          action: () => setExtraBurn(parseInt(extraBurn || 0) + Math.ceil(surplus / 5) * 5)
+        });
+      }
+    }
+    
+    return suggestions;
+  };
+  
+  const suggestions = generateOffTrackSuggestions();
+  
+  return e('div', { className: "px-5 pt-4" },
+    e('div', { className: "mb-6" },
+      e('p', { className: "text-zinc-500 text-sm font-mono-d uppercase tracking-wider" }, "Calculator"),
+      e('h1', { className: "text-white text-3xl font-display font-bold flex items-center gap-2" }, 
+        "What if",
+        e('span', { className: "text-emerald-400" }, "?")
+      )
+    ),
+    
+    e('p', { className: "text-zinc-500 text-sm mb-5 leading-snug" }, 
+      "Plan ahead — see how extra food, exercise, or steps affect your daily balance."
+    ),
+    
+    // Current state
+    e('div', { className: "bg-zinc-900/80 rounded-2xl p-4 mb-4 border border-white/5" },
+      e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, "Current today"),
+      e('div', { className: "grid grid-cols-3 gap-2" },
+        e('div', null,
+          e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Eaten"),
+          e('p', { className: "text-cyan-300 font-display font-bold" }, totalEaten)
+        ),
+        e('div', null,
+          e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Burned"),
+          e('p', { className: "text-orange-300 font-display font-bold" }, tdee + totalBurned)
+        ),
+        e('div', null,
+          e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Balance"),
+          e('p', { className: `font-display font-bold ${balance < 0 ? 'text-emerald-400' : 'text-orange-400'}` }, 
+            balance > 0 ? '+' : '',
+            balance
+          )
+        )
+      )
+    ),
+    
+    // Sliders / inputs
+    e('div', { className: "space-y-3 mb-4" },
+      // Extra food
+      e('div', { className: "bg-zinc-900/80 rounded-2xl p-4 border border-white/5" },
+        e('div', { className: "flex justify-between items-center mb-3" },
+          e('div', { className: "flex items-center gap-2" },
+            e('span', { className: "text-2xl" }, "🍽️"),
+            e('p', { className: "text-white font-display font-semibold text-sm" }, "Extra food")
+          ),
+          e('p', { className: `font-display font-bold ${extraEat > 0 ? 'text-cyan-400' : 'text-zinc-500'}` }, 
+            extraEat > 0 ? `+${extraEat}` : extraEat,
+            e('span', { className: "text-xs text-zinc-500 ml-1" }, "kcal")
+          )
+        ),
+        e('input', {
+          type: "range",
+          min: -800,
+          max: 1500,
+          step: 50,
+          value: extraEat,
+          onChange: (ev) => setExtraEat(parseInt(ev.target.value)),
+          className: "w-full accent-cyan-400"
+        }),
+        e('div', { className: "flex gap-1.5 mt-2" },
+          [
+            { v: 200, label: "snack" },
+            { v: 500, label: "meal" },
+            { v: 800, label: "big meal" },
+            { v: 0, label: "reset" },
+          ].map(p => 
+            e('button', { 
+              key: p.label,
+              onClick: () => setExtraEat(p.v),
+              className: "flex-1 bg-zinc-800 text-zinc-400 rounded-lg py-1.5 text-[10px] font-mono-d uppercase active:scale-95"
+            }, p.label)
+          )
+        )
+      ),
+      
+      // Extra workout burn
+      e('div', { className: "bg-zinc-900/80 rounded-2xl p-4 border border-white/5" },
+        e('div', { className: "flex justify-between items-center mb-3" },
+          e('div', { className: "flex items-center gap-2" },
+            e('span', { className: "text-2xl" }, "🔥"),
+            e('p', { className: "text-white font-display font-semibold text-sm" }, "Extra cardio/workout")
+          ),
+          e('p', { className: `font-display font-bold ${extraBurn > 0 ? 'text-orange-400' : 'text-zinc-500'}` }, 
+            extraBurn > 0 ? `−${extraBurn}` : extraBurn,
+            e('span', { className: "text-xs text-zinc-500 ml-1" }, "kcal")
+          )
+        ),
+        e('input', {
+          type: "range",
+          min: 0,
+          max: 800,
+          step: 25,
+          value: extraBurn,
+          onChange: (ev) => setExtraBurn(parseInt(ev.target.value)),
+          className: "w-full accent-orange-400"
+        }),
+        e('div', { className: "flex gap-1.5 mt-2" },
+          [
+            { v: 100, label: "20m walk" },
+            { v: 200, label: "30m run" },
+            { v: 350, label: "45m hard" },
+            { v: 0, label: "reset" },
+          ].map(p => 
+            e('button', { 
+              key: p.label,
+              onClick: () => setExtraBurn(p.v),
+              className: "flex-1 bg-zinc-800 text-zinc-400 rounded-lg py-1.5 text-[10px] font-mono-d uppercase active:scale-95"
+            }, p.label)
+          )
+        )
+      ),
+      
+      // Extra steps
+      e('div', { className: "bg-zinc-900/80 rounded-2xl p-4 border border-white/5" },
+        e('div', { className: "flex justify-between items-center mb-3" },
+          e('div', { className: "flex items-center gap-2" },
+            e('span', { className: "text-2xl" }, "👟"),
+            e('p', { className: "text-white font-display font-semibold text-sm" }, "Extra steps")
+          ),
+          e('div', { className: "text-right" },
+            e('p', { className: `font-display font-bold ${extraSteps > 0 ? 'text-emerald-400' : 'text-zinc-500'}` }, 
+              extraSteps > 0 ? `+${extraSteps}` : extraSteps
+            ),
+            e('p', { className: "text-[10px] text-zinc-500 font-mono-d" }, 
+              extraSteps > 0 ? `~−${stepsBurn} kcal` : ""
+            )
+          )
+        ),
+        e('input', {
+          type: "range",
+          min: 0,
+          max: 15000,
+          step: 500,
+          value: extraSteps,
+          onChange: (ev) => setExtraSteps(parseInt(ev.target.value)),
+          className: "w-full accent-emerald-400"
+        })
+      )
+    ),
+    
+    // Result
+    e('div', { 
+      className: `rounded-3xl p-5 mb-4 border ${
+        isOnTrack ? 'bg-gradient-to-br from-emerald-500/20 to-cyan-500/10 border-emerald-500/30' :
+        isTooAggressive ? 'bg-gradient-to-br from-rose-500/20 to-orange-500/10 border-rose-500/30' :
+        'bg-gradient-to-br from-yellow-500/20 to-orange-500/10 border-yellow-500/30'
+      }`
+    },
+      e('div', { className: "flex justify-between items-start mb-4" },
+        e('div', null,
+          e('p', { className: "text-zinc-400 text-[10px] font-mono-d uppercase tracking-widest mb-1" }, "New balance"),
+          e('div', { className: "flex items-baseline gap-2" },
+            e('span', { 
+              className: `text-4xl font-display font-bold ${newBalance < 0 ? 'text-emerald-300' : newBalance > 0 ? 'text-orange-300' : 'text-white'}`
+            }, 
+              newBalance > 0 ? '+' : '',
+              newBalance
+            ),
+            e('span', { className: "text-zinc-500 text-xs font-mono-d" }, "kcal")
+          )
+        ),
+        e('div', { className: "text-right" },
+          e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "vs current"),
+          e('p', { 
+            className: `text-sm font-mono-d font-bold ${(newBalance - balance) < 0 ? 'text-emerald-300' : (newBalance - balance) > 0 ? 'text-orange-300' : 'text-zinc-400'}`
+          },
+            newBalance - balance > 0 ? '+' : '',
+            newBalance - balance,
+            " kcal"
+          )
+        )
+      ),
+      
+      // Status badge
+      e('div', { className: "flex items-center justify-between" },
+        e('p', { 
+          className: `text-sm font-display font-semibold ${
+            isOnTrack ? 'text-emerald-300' :
+            isTooAggressive ? 'text-rose-300' :
+            'text-yellow-300'
+          }`
+        }, 
+          isOnTrack ? "✓ On track for your " + data.goalType :
+          isTooAggressive ? "⚠ Too aggressive" :
+          data.goalType === "cut" ? "Not enough deficit" :
+          data.goalType === "bulk" ? "Not enough surplus" :
+          "Off balance"
+        ),
+        e('span', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, 
+          `target: ${goalRange.min} to ${goalRange.max}`
+        )
+      )
+    ),
+    
+    // Off-track suggestions
+    !isOnTrack && suggestions.length > 0 && e('div', { className: "mb-4" },
+      e('h3', { className: "text-white font-display font-semibold mb-3 flex items-center gap-2" },
+        e(Icon, { d: icons.bulb, size: 16, className: "text-yellow-400" }),
+        "Get back on track"
+      ),
+      e('div', { className: "space-y-2" },
+        suggestions.map((s, i) => 
+          e('button', {
+            key: i,
+            onClick: s.action,
+            className: "w-full bg-zinc-900/80 rounded-2xl p-4 border border-white/5 active:scale-[0.98] text-left flex items-center gap-3"
+          },
+            e('div', { className: "text-2xl flex-shrink-0" }, s.emoji),
+            e('div', { className: "flex-1" },
+              e('p', { className: "text-white font-display font-semibold text-sm" }, s.title),
+              e('p', { className: "text-zinc-400 text-xs leading-snug" }, s.detail)
+            ),
+            e('div', { className: "text-emerald-400 text-xs font-mono-d uppercase" }, "apply")
+          )
+        )
+      )
+    ),
+    
+    // Reset button
+    (extraEat !== 0 || extraBurn !== 0 || extraSteps !== 0) && e('button', { 
+      onClick: () => { setExtraEat(0); setExtraBurn(0); setExtraSteps(0); },
+      className: "w-full bg-zinc-800 text-zinc-400 rounded-xl py-3 font-display font-semibold text-sm mb-4"
+    }, "↻ Reset all")
+  );
+};
+
+// ============ PHOTO THUMBNAIL ============
+const PhotoThumbnail = ({ photo, onClick }) => {
+  const [url, setUrl] = uS(null);
+  
+  uE(() => {
+    const blob = photo.thumbnail || photo.blob;
+    const u = URL.createObjectURL(blob);
+    setUrl(u);
+    return () => URL.revokeObjectURL(u);
+  }, [photo.id]);
+  
+  const dateStr = new Date(photo.dateISO).toLocaleDateString('en-US', { 
+    month: 'short', day: 'numeric' 
+  });
+  
+  return e('button', { 
+    onClick,
+    className: "relative aspect-[3/4] rounded-xl overflow-hidden bg-zinc-800 active:scale-[0.97] transition"
+  },
+    url && e('img', { 
+      src: url,
+      className: "w-full h-full object-cover"
+    }),
+    // Date overlay
+    e('div', { className: "absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-2" },
+      e('p', { className: "text-white text-[10px] font-mono-d font-bold" }, dateStr),
+      photo.weight && e('p', { className: "text-zinc-300 text-[9px] font-mono-d" }, `${photo.weight}kg`)
+    ),
+    // Angle badge
+    e('div', { className: "absolute top-1.5 right-1.5 bg-black/60 backdrop-blur rounded-full w-6 h-6 flex items-center justify-center text-xs" }, 
+      photo.angle === 'side' ? '🚶' : photo.angle === 'back' ? '🧍‍♂️' : '🧍'
+    )
+  );
+};
+
+// ============ EXERCISE PROGRESS CARD ============
+const renderExerciseProgressCard = (ex) => {
+  const sessions = ex.sessions;
+  const isCardio = sessions[0].type === "cardio";
+  const last = sessions[sessions.length - 1];
+  const first = sessions[0];
+  
+  if (isCardio) {
+    // Cardio progress
+    const points = sessions.map(s => s.totalDuration);
+    const minP = Math.min(...points);
+    const maxP = Math.max(...points) || 1;
+    const trend = sessions.length >= 2 ? last.totalDuration - first.totalDuration : 0;
+    
+    return e('div', { 
+      key: ex.name,
+      className: "bg-zinc-900/80 rounded-2xl p-4 border border-white/5"
+    },
+      e('div', { className: "flex justify-between items-start mb-2" },
+        e('div', { className: "flex-1 min-w-0" },
+          e('p', { className: "text-white font-display font-semibold text-sm truncate" }, ex.name),
+          e('p', { className: "text-zinc-500 text-[10px] font-mono-d" }, 
+            `${sessions.length} session${sessions.length > 1 ? 's' : ''} · ${last.totalDuration}min lvl ${last.avgLevel}`
+          )
+        ),
+        e('span', { 
+          className: `text-[10px] font-mono-d uppercase ${trend > 0 ? 'text-emerald-400' : trend < 0 ? 'text-rose-400' : 'text-zinc-500'}` 
+        },
+          sessions.length >= 2 ? `${trend > 0 ? '+' : ''}${trend}min` : "—"
+        )
+      ),
+      // Mini chart
+      sessions.length >= 2 && e('div', { className: "flex items-end gap-0.5 h-8 mt-2" },
+        points.map((v, i) => e('div', {
+          key: i,
+          className: `flex-1 rounded-sm ${i === points.length - 1 ? 'bg-orange-400' : 'bg-zinc-700'}`,
+          style: { 
+            height: `${maxP === minP ? 50 : ((v - minP) / (maxP - minP)) * 80 + 20}%`,
+            minHeight: '3px'
+          }
+        }))
+      )
+    );
+  }
+  
+  // Strength progress
+  const oneRMPoints = sessions.map(s => s.oneRMEstimate);
+  const minRM = Math.min(...oneRMPoints);
+  const maxRM = Math.max(...oneRMPoints);
+  const range = maxRM - minRM || 1;
+  const trend = sessions.length >= 2 ? last.oneRMEstimate - first.oneRMEstimate : 0;
+  const lastBest = last.bestSet;
+  
+  return e('div', { 
+    key: ex.name,
+    className: "bg-zinc-900/80 rounded-2xl p-4 border border-white/5"
+  },
+    e('div', { className: "flex justify-between items-start mb-2" },
+      e('div', { className: "flex-1 min-w-0" },
+        e('p', { className: "text-white font-display font-semibold text-sm truncate" }, ex.name),
+        e('p', { className: "text-zinc-500 text-[10px] font-mono-d" }, 
+          `${sessions.length} session${sessions.length > 1 ? 's' : ''} · last: ${lastBest.weight}kg × ${lastBest.reps}`
+        )
+      ),
+      e('div', { className: "text-right ml-2" },
+        e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Est. 1RM"),
+        e('div', { className: "flex items-baseline gap-1" },
+          e('span', { className: "text-orange-400 font-display font-bold text-lg" }, last.oneRMEstimate),
+          e('span', { className: "text-[10px] text-zinc-500 font-mono-d" }, "kg")
+        ),
+        sessions.length >= 2 && e('p', { 
+          className: `text-[9px] font-mono-d ${trend > 0 ? 'text-emerald-400' : trend < 0 ? 'text-rose-400' : 'text-zinc-500'}` 
+        }, `${trend > 0 ? '+' : ''}${trend}kg`)
+      )
+    ),
+    // Mini chart
+    sessions.length >= 2 && e('div', { className: "flex items-end gap-0.5 h-8 mt-2" },
+      oneRMPoints.map((v, i) => e('div', {
+        key: i,
+        className: `flex-1 rounded-sm ${i === oneRMPoints.length - 1 ? 'bg-orange-400' : 'bg-zinc-700'}`,
+        style: { 
+          height: `${minRM === maxRM ? 50 : ((v - minRM) / range) * 80 + 20}%`,
+          minHeight: '3px'
+        }
+      }))
     )
   );
 };
