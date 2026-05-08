@@ -634,7 +634,6 @@ const App = () => {
         type: "file",
         accept: "image/*",
         multiple: true,
-        capture: "environment",
         onChange: (ev) => handleScreenshotImport(ev.target.files),
         style: { display: 'none' }
       })
@@ -929,12 +928,17 @@ const App = () => {
     modal === 'weight' && e(WeightModal, { 
       data, 
       onClose: () => setModal(null), 
-      onSave: (w) => { 
-        const entry = { weight: w, date: new Date().toISOString() };
-        updateData({ 
-          bodyWeight: w, 
-          weightHistory: [...data.weightHistory, entry] 
-        }); 
+      onSave: (payload) => { 
+        if (payload.targetWeight !== undefined) {
+          updateData({ targetWeight: payload.targetWeight });
+        } else if (payload.bodyWeight !== undefined) {
+          const updates = { bodyWeight: payload.bodyWeight };
+          if (payload.addToHistory) {
+            const entry = { weight: payload.bodyWeight, date: new Date().toISOString() };
+            updates.weightHistory = [...data.weightHistory, entry];
+          }
+          updateData(updates);
+        }
         setModal(null); 
       }
     }),
@@ -1172,6 +1176,9 @@ const GoalModal = ({ data, onClose, onSave }) => {
 
 const WeightModal = ({ data, onClose, onSave }) => {
   const [val, setVal] = uS("");
+  const [editingTarget, setEditingTarget] = uS(false);
+  const [targetVal, setTargetVal] = uS(String(data.targetWeight));
+  
   return e(Modal, { onClose, title: "Log weight" },
     e('p', { className: "text-zinc-500 text-sm mb-5" }, 
       "Track weekly to see real progress without daily fluctuations."
@@ -1184,22 +1191,47 @@ const WeightModal = ({ data, onClose, onSave }) => {
           e('span', { className: "text-sm text-zinc-500" }, " kg")
         )
       ),
-      e('div', { className: "bg-purple-500/10 border border-purple-500/20 rounded-2xl p-4" },
-        e('p', { className: "text-[10px] text-purple-400 font-mono-d uppercase mb-1" }, "Target"),
-        e('p', { className: "text-white text-xl font-display font-bold" }, 
-          data.targetWeight,
-          e('span', { className: "text-sm text-zinc-500" }, " kg")
-        )
+      // Tappable target weight card
+      e('button', { 
+        onClick: () => setEditingTarget(!editingTarget),
+        className: "bg-purple-500/10 border border-purple-500/20 rounded-2xl p-4 active:scale-95 transition text-left"
+      },
+        e('p', { className: "text-[10px] text-purple-400 font-mono-d uppercase mb-1 flex items-center gap-1" }, 
+          "Target ",
+          e(Icon, { d: icons.edit, size: 8 })
+        ),
+        editingTarget ?
+          e('input', {
+            value: targetVal,
+            onChange: (ev) => setTargetVal(ev.target.value),
+            onClick: (ev) => ev.stopPropagation(),
+            type: "number",
+            step: "0.1",
+            autoFocus: true,
+            className: "w-full bg-transparent text-white text-xl font-display font-bold outline-none p-0"
+          }) :
+          e('p', { className: "text-white text-xl font-display font-bold" }, 
+            data.targetWeight,
+            e('span', { className: "text-sm text-zinc-500" }, " kg")
+          )
       )
     ),
-    e('input', { 
+    
+    // Show new weight input only when not editing target
+    !editingTarget && e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, "Enter today's weight"),
+    !editingTarget && e('input', { 
       value: val,
       onChange: (ev) => setVal(ev.target.value),
       type: "number",
       step: "0.1",
-      placeholder: "74.5",
+      placeholder: "e.g. 74.5",
       className: "w-full bg-zinc-800 text-white text-2xl font-display font-bold rounded-xl px-4 py-4 mb-4 placeholder-zinc-600 outline-none focus:ring-2 focus:ring-purple-400 text-center"
     }),
+    
+    editingTarget && e('p', { className: "text-[10px] text-purple-400 font-mono-d uppercase mb-4 text-center" }, 
+      "Editing target — tap save when done"
+    ),
+    
     e('div', { className: "flex gap-3" },
       e('button', { 
         onClick: onClose,
@@ -1207,13 +1239,18 @@ const WeightModal = ({ data, onClose, onSave }) => {
       }, "Cancel"),
       e('button', { 
         onClick: () => {
-          const w = parseFloat(val);
-          if (w > 0) onSave(w);
+          const newTarget = editingTarget ? parseFloat(targetVal) : null;
+          const newWeight = !editingTarget && val ? parseFloat(val) : null;
+          if (editingTarget && newTarget > 0) {
+            onSave({ targetWeight: newTarget });
+          } else if (newWeight > 0) {
+            onSave({ bodyWeight: newWeight, addToHistory: true });
+          }
         },
         className: "flex-1 bg-purple-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
       },
         e(Icon, { d: icons.check, size: 18, stroke: "black" }),
-        "Save"
+        editingTarget ? "Save target" : "Save weight"
       )
     )
   );
