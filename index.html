@@ -729,6 +729,335 @@ const buildSleepData = (sleepHistory, todaySleep) => {
   return combined.sort((a, b) => new Date(a.dateISO) - new Date(b.dateISO));
 };
 
+// ============== HEALTH SCORE ENGINE ==============
+// Calculates a 0-100 health score from 5 dimensions:
+//   Sleep (25), Training (25), Weight (20), Nutrition (15), Recovery/Energy (15)
+// Returns: { total, dimensions: [{name, score, max, status, detail, tip}], topTip }
+const calculateHealthScore = (data, sleepData, exerciseProgress) => {
+  const today = new Date().toDateString();
+  const archived = data.coachingHistory || [];
+  const allWorkouts = [...(data.workoutHistory || []), ...(data.workouts || [])];
+  
+  // ====== SLEEP DIMENSION (25 points) ======
+  let sleepScore = 0;
+  let sleepDetail = "Not enough data to score";
+  let sleepTip = "Log sleep daily for 7+ nights to get a sleep score";
+  let sleepStatus = "no_data";
+  
+  if (sleepData && sleepData.length >= 3) {
+    const recent = sleepData.slice(-7);
+    const avg = recent.reduce((s, d) => s + d.hours, 0) / recent.length;
+    
+    // Average hours score (15 pts max — 8h = full)
+    let avgScore = 0;
+    if (avg >= 7.5) avgScore = 15;
+    else if (avg >= 7) avgScore = 12;
+    else if (avg >= 6.5) avgScore = 9;
+    else if (avg >= 6) avgScore = 6;
+    else if (avg >= 5) avgScore = 3;
+    
+    // Consistency score (10 pts max — std dev under 0.5h = full)
+    const variance = recent.reduce((s, d) => s + Math.pow(d.hours - avg, 2), 0) / recent.length;
+    const stdDev = Math.sqrt(variance);
+    let consScore = 0;
+    if (stdDev <= 0.5) consScore = 10;
+    else if (stdDev <= 1) consScore = 7;
+    else if (stdDev <= 1.5) consScore = 4;
+    else consScore = 2;
+    
+    sleepScore = avgScore + consScore;
+    sleepDetail = `${avg.toFixed(1)}h avg · ±${stdDev.toFixed(1)}h consistency`;
+    
+    if (avg < 7) {
+      sleepTip = `Average ${avg.toFixed(1)}h — try to hit 8h for ${avg < 6.5 ? '+9' : '+6'} pts`;
+      sleepStatus = "low";
+    } else if (stdDev > 1) {
+      sleepTip = `Bedtime varies by ±${stdDev.toFixed(1)}h — go to bed at the same time for +6 pts`;
+      sleepStatus = "inconsistent";
+    } else {
+      sleepTip = avg >= 7.5 ? "Solid sleep schedule — keep it up" : "Push toward 8h average for max points";
+      sleepStatus = "good";
+    }
+  }
+  
+  // ====== TRAINING DIMENSION (25 points) ======
+  let trainingScore = 0;
+  let trainingDetail = "Set targets and log workouts";
+  let trainingTip = "Set your weekly schedule on Home tab";
+  let trainingStatus = "no_data";
+  
+  // Compute current week's workouts (by day-of-week intersection)
+  const now = new Date();
+  const dayOfWeek = now.getDay();
+  const monday = new Date(now);
+  const daysToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+  monday.setDate(now.getDate() - daysToMonday);
+  monday.setHours(0, 0, 0, 0);
+  
+  let weekWorkoutsCompleted = 0;
+  let weekTargetDays = 0;
+  let weekRestDays = 0;
+  let weekRestKept = 0;
+  
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(monday);
+    d.setDate(monday.getDate() + i);
+    const dStr = d.toDateString();
+    const dayIdx = d.getDay();
+    const target = (data.workoutSchedule || {})[dayIdx];
+    const isPastOrToday = d <= now;
+    
+    if (target === 'workout') {
+      if (isPastOrToday) weekTargetDays++;
+      const did = dStr === today 
+        ? data.workouts.length > 0 
+        : (data.workoutHistory || []).some(w => w.date === dStr);
+      if (did) weekWorkoutsCompleted++;
+    } else if (target === 'rest' && isPastOrToday) {
+      weekRestDays++;
+      const did = dStr === today 
+        ? data.workouts.length > 0 
+        : (data.workoutHistory || []).some(w => w.date === dStr);
+      if (!did) weekRestKept++;
+    }
+  }
+  
+  if (weekTargetDays > 0 || weekRestDays > 0) {
+    // Workout completion (18 pts max)
+    let completionScore = 0;
+    if (weekTargetDays > 0) {
+      const ratio = weekWorkoutsCompleted / weekTargetDays;
+      completionScore = Math.round(ratio * 18);
+    } else {
+      completionScore = 9; // partial credit if no targets set
+    }
+    
+    // Rest day discipline (7 pts max — sticking to planned rest)
+    let restScore = 0;
+    if (weekRestDays > 0) {
+      const restRatio = weekRestKept / weekRestDays;
+      restScore = Math.round(restRatio * 7);
+    } else {
+      restScore = 4; // partial credit
+    }
+    
+    trainingScore = completionScore + restScore;
+    trainingDetail = `${weekWorkoutsCompleted}/${weekTargetDays} planned workouts done`;
+    
+    if (weekWorkoutsCompleted < weekTargetDays) {
+      const missed = weekTargetDays - weekWorkoutsCompleted;
+      trainingTip = `${missed} planned session${missed > 1 ? 's' : ''} missed — get back on schedule for +${missed * 4} pts`;
+      trainingStatus = "behind";
+    } else if (weekTargetDays > 0 && weekWorkoutsCompleted >= weekTargetDays) {
+      trainingTip = "All planned workouts done — keep it up";
+      trainingStatus = "good";
+    } else {
+      trainingTip = "Set your weekly training schedule for full points";
+      trainingStatus = "no_targets";
+    }
+  } else if (allWorkouts.length > 0) {
+    // No targets set, but workouts logged
+    trainingScore = 12;
+    trainingDetail = `${allWorkouts.length} total workouts logged`;
+    trainingTip = "Set weekly training targets to score this dimension fully";
+    trainingStatus = "no_targets";
+  }
+  
+  // ====== WEIGHT DIMENSION (20 points) ======
+  let weightScore = 0;
+  let weightDetail = "Need 4+ weight entries";
+  let weightTip = "Log weight weekly to track progress";
+  let weightStatus = "no_data";
+  
+  const wHist = data.weightHistory || [];
+  if (wHist.length >= 2) {
+    const oldest = wHist[Math.max(0, wHist.length - 4)].weight;
+    const latest = wHist[wHist.length - 1].weight;
+    const change = latest - oldest;
+    const target = data.targetWeight;
+    const direction = data.goalType === "cut" ? -1 : data.goalType === "bulk" ? 1 : 0;
+    const distanceToGoal = Math.abs(latest - target);
+    
+    if (data.goalType === "maintain") {
+      // Reward stability
+      if (Math.abs(change) <= 0.5) weightScore = 20;
+      else if (Math.abs(change) <= 1) weightScore = 15;
+      else if (Math.abs(change) <= 2) weightScore = 10;
+      else weightScore = 5;
+      weightDetail = `${change > 0 ? '+' : ''}${change.toFixed(1)}kg over ${wHist.length} entries`;
+      weightStatus = Math.abs(change) <= 1 ? "good" : "drifting";
+      weightTip = weightStatus === "good" ? "Weight stable — perfect maintenance" : "Drifting — adjust intake to stabilize";
+    } else {
+      // Cut or bulk — reward movement in correct direction at sustainable pace
+      const rateKgPerWeek = wHist.length >= 2 
+        ? (latest - wHist[Math.max(0, wHist.length - 4)].weight) / Math.max(1, (new Date(latest).getTime ? 1 : Math.min(4, wHist.length - 1)))
+        : 0;
+      
+      if (direction === -1) {
+        // Cutting — want negative change at 0.3-0.7 kg/week
+        if (change <= 0 && Math.abs(change / Math.max(1, wHist.length - 1)) <= 1) {
+          weightScore = 20;
+          weightStatus = "good";
+        } else if (change <= 0) {
+          weightScore = 14;
+          weightStatus = "fast"; // losing too fast
+        } else if (change <= 0.5) {
+          weightScore = 10;
+          weightStatus = "stalling";
+        } else {
+          weightScore = 4;
+          weightStatus = "wrong_direction";
+        }
+      } else {
+        // Bulking — want positive change at 0.2-0.4 kg/week
+        if (change >= 0 && change <= 1.5 * Math.max(1, wHist.length - 1)) {
+          weightScore = 20;
+          weightStatus = "good";
+        } else if (change >= 0) {
+          weightScore = 14;
+          weightStatus = "fast";
+        } else if (change >= -0.5) {
+          weightScore = 10;
+          weightStatus = "stalling";
+        } else {
+          weightScore = 4;
+          weightStatus = "wrong_direction";
+        }
+      }
+      
+      weightDetail = `${change > 0 ? '+' : ''}${change.toFixed(1)}kg · ${distanceToGoal.toFixed(1)}kg to goal`;
+      
+      if (weightStatus === "good") weightTip = `On track for ${data.goalType} goal`;
+      else if (weightStatus === "fast") weightTip = `Changing fast — ease off slightly to preserve muscle`;
+      else if (weightStatus === "stalling") weightTip = data.goalType === "cut" ? `Stalling — increase deficit by ~200 kcal/day for +6 pts` : `Stalling — eat ~300 more kcal/day for +6 pts`;
+      else weightTip = `Moving wrong direction — review your daily balance in What If`;
+    }
+  }
+  
+  // ====== NUTRITION DIMENSION (15 points) ======
+  let nutritionScore = 0;
+  let nutritionDetail = "Log meals to score";
+  let nutritionTip = "Log your meals daily for nutrition score";
+  let nutritionStatus = "no_data";
+  
+  // Score based on logging consistency (last 7 days) + today's macros
+  const last7Days = [...archived.slice(-6), { 
+    date: today, 
+    meals: data.meals || [], 
+    totalEaten: (data.meals || []).reduce((s, m) => s + (m.kcal || 0), 0) 
+  }];
+  
+  const daysWithLogging = last7Days.filter(d => d.meals && d.meals.length >= 2).length;
+  
+  if (daysWithLogging > 0) {
+    // Logging consistency (10 pts max)
+    const consScore = Math.round((daysWithLogging / 7) * 10);
+    
+    // Today's calorie target adherence (5 pts max)
+    const todayTotalEaten = (data.meals || []).reduce((s, m) => s + (m.kcal || 0), 0);
+    let adhScore = 0;
+    if (todayTotalEaten > 0) {
+      const ratio = todayTotalEaten / data.caloriesGoal;
+      if (ratio >= 0.85 && ratio <= 1.05) adhScore = 5;
+      else if (ratio >= 0.7 && ratio <= 1.15) adhScore = 3;
+      else if (ratio >= 0.5) adhScore = 1;
+    } else {
+      // Pre-evening grace — only penalize after 8pm if nothing logged
+      if (now.getHours() < 20) adhScore = 3;
+    }
+    
+    nutritionScore = consScore + adhScore;
+    nutritionDetail = `${daysWithLogging}/7 days logged consistently`;
+    
+    if (daysWithLogging < 5) {
+      nutritionTip = `Only ${daysWithLogging}/7 days logged — log meals daily for +${(7 - daysWithLogging) * 1.4 | 0} pts`;
+      nutritionStatus = "inconsistent";
+    } else if (todayTotalEaten === 0 && now.getHours() >= 20) {
+      nutritionTip = "Nothing logged today — quick log saves your streak";
+      nutritionStatus = "missed_today";
+    } else {
+      nutritionTip = "Solid logging consistency";
+      nutritionStatus = "good";
+    }
+  }
+  
+  // ====== RECOVERY & ENERGY DIMENSION (15 points) ======
+  let recoveryScore = 0;
+  let recoveryDetail = "Log workout energy to score";
+  let recoveryTip = "Rate your energy 1-5 after each workout";
+  let recoveryStatus = "no_data";
+  
+  // Pull energy levels from recent workouts
+  const recentWorkouts = allWorkouts.filter(w => w.energyLevel).slice(-7);
+  
+  if (recentWorkouts.length >= 2) {
+    const avgEnergy = recentWorkouts.reduce((s, w) => s + w.energyLevel, 0) / recentWorkouts.length;
+    
+    // Energy avg (10 pts max)
+    let energyScore = 0;
+    if (avgEnergy >= 4) energyScore = 10;
+    else if (avgEnergy >= 3.5) energyScore = 8;
+    else if (avgEnergy >= 3) energyScore = 6;
+    else if (avgEnergy >= 2.5) energyScore = 4;
+    else energyScore = 2;
+    
+    // Rest day adherence (5 pts max — already computed above)
+    let restAdh = 0;
+    if (weekRestDays > 0) {
+      restAdh = Math.round((weekRestKept / weekRestDays) * 5);
+    } else {
+      restAdh = 3;
+    }
+    
+    recoveryScore = energyScore + restAdh;
+    recoveryDetail = `Energy ${avgEnergy.toFixed(1)}/5 · ${weekRestKept}/${weekRestDays || '?'} rest days kept`;
+    
+    if (avgEnergy < 3) {
+      recoveryTip = `Avg energy ${avgEnergy.toFixed(1)}/5 — sleep more, eat enough, take rest days`;
+      recoveryStatus = "low";
+    } else if (avgEnergy >= 4) {
+      recoveryTip = "High energy levels — recovery is dialed in";
+      recoveryStatus = "good";
+    } else {
+      recoveryTip = "Energy is okay — push toward 4+ for max points";
+      recoveryStatus = "moderate";
+    }
+  } else if (allWorkouts.length > 0) {
+    // Has workouts but no energy logged
+    recoveryScore = 5;
+    recoveryDetail = `${allWorkouts.length} workouts logged · 0 with energy ratings`;
+    recoveryTip = "Rate your energy 1-5 after each workout for full points";
+    recoveryStatus = "no_energy";
+  }
+  
+  const total = sleepScore + trainingScore + weightScore + nutritionScore + recoveryScore;
+  
+  // Find the dimension with the lowest % score (biggest improvement opportunity)
+  const dimensions = [
+    { name: "Sleep", score: sleepScore, max: 25, detail: sleepDetail, tip: sleepTip, status: sleepStatus, emoji: "😴" },
+    { name: "Training", score: trainingScore, max: 25, detail: trainingDetail, tip: trainingTip, status: trainingStatus, emoji: "💪" },
+    { name: "Weight", score: weightScore, max: 20, detail: weightDetail, tip: weightTip, status: weightStatus, emoji: "⚖️" },
+    { name: "Nutrition", score: nutritionScore, max: 15, detail: nutritionDetail, tip: nutritionTip, status: nutritionStatus, emoji: "🍽️" },
+    { name: "Recovery", score: recoveryScore, max: 15, detail: recoveryDetail, tip: recoveryTip, status: recoveryStatus, emoji: "🔋" },
+  ];
+  
+  // Top tip = lowest scoring dimension that has actionable advice
+  const actionable = dimensions
+    .filter(d => d.status !== "no_data" && d.status !== "good")
+    .sort((a, b) => (a.score / a.max) - (b.score / b.max));
+  const topTip = actionable[0] || null;
+  
+  // Determine score grade
+  let grade, gradeColor;
+  if (total >= 85) { grade = "Excellent"; gradeColor = "from-emerald-400 to-cyan-400"; }
+  else if (total >= 70) { grade = "Good"; gradeColor = "from-cyan-400 to-blue-400"; }
+  else if (total >= 55) { grade = "Fair"; gradeColor = "from-yellow-400 to-orange-400"; }
+  else if (total >= 40) { grade = "Needs work"; gradeColor = "from-orange-400 to-rose-400"; }
+  else { grade = "Just starting"; gradeColor = "from-rose-400 to-pink-400"; }
+  
+  return { total, dimensions, topTip, grade, gradeColor };
+};
+
 // ============== AI COACHING (Claude API) ==============
 // Builds a comprehensive prompt with all user data and asks Claude for personalized advice.
 const generateAICoaching = async (data, apiKey) => {
@@ -1752,6 +2081,119 @@ const App = () => {
         e(Icon, { d: icons.chevron, size: 18, className: "text-zinc-500" })
       ),
 
+      // HEALTH SCORE PANEL
+      (() => {
+        const sleepData = buildSleepData(data.sleepHistory, data.sleepHours);
+        const exerciseProgress = buildExerciseProgress(data.workoutHistory, data.workouts);
+        const score = calculateHealthScore(data, sleepData, exerciseProgress);
+        
+        return e('div', { 
+          className: "rounded-3xl bg-gradient-to-br from-zinc-900 via-zinc-900 to-zinc-950 p-5 mb-4 border border-white/5 relative overflow-hidden"
+        },
+          // Background glow
+          e('div', { 
+            className: `absolute -top-12 -right-12 w-40 h-40 rounded-full blur-3xl opacity-30 bg-gradient-to-br ${score.gradeColor}`
+          }),
+          
+          e('div', { className: "relative" },
+            // Top row — score + grade
+            e('div', { className: "flex justify-between items-start mb-4" },
+              e('div', null,
+                e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase tracking-widest mb-1" }, "Health score"),
+                e('div', { className: "flex items-baseline gap-2" },
+                  e('span', { 
+                    className: `text-5xl font-display font-bold bg-gradient-to-br ${score.gradeColor} bg-clip-text text-transparent`
+                  }, score.total),
+                  e('span', { className: "text-zinc-500 text-sm font-mono-d" }, "/ 100")
+                ),
+                e('p', { 
+                  className: `text-xs font-display font-semibold mt-1 bg-gradient-to-r ${score.gradeColor} bg-clip-text text-transparent`
+                }, score.grade)
+              ),
+              // Circular progress
+              e('div', { className: "relative w-16 h-16" },
+                e('svg', { className: "w-16 h-16 -rotate-90", viewBox: "0 0 64 64" },
+                  e('circle', { cx: 32, cy: 32, r: 28, stroke: "rgb(39, 39, 42)", strokeWidth: 5, fill: "none" }),
+                  e('circle', { 
+                    cx: 32, cy: 32, r: 28, 
+                    stroke: "url(#scoreGrad)",
+                    strokeWidth: 5,
+                    fill: "none",
+                    strokeLinecap: "round",
+                    strokeDasharray: 175.929,
+                    strokeDashoffset: 175.929 * (1 - score.total / 100),
+                    style: { transition: 'stroke-dashoffset 0.7s ease' }
+                  }),
+                  e('defs', null,
+                    e('linearGradient', { id: "scoreGrad", x1: "0%", y1: "0%", x2: "100%", y2: "0%" },
+                      e('stop', { offset: "0%", stopColor: score.total >= 70 ? "#34d399" : score.total >= 50 ? "#fbbf24" : "#fb7185" }),
+                      e('stop', { offset: "100%", stopColor: score.total >= 70 ? "#22d3ee" : score.total >= 50 ? "#fb923c" : "#ec4899" })
+                    )
+                  )
+                )
+              )
+            ),
+            
+            // Subscores
+            e('div', { className: "space-y-2 mb-4" },
+              score.dimensions.map((dim, i) => {
+                const pct = (dim.score / dim.max) * 100;
+                const barColor = 
+                  dim.status === "no_data" ? "bg-zinc-700" :
+                  pct >= 80 ? "bg-emerald-400" :
+                  pct >= 60 ? "bg-cyan-400" :
+                  pct >= 40 ? "bg-yellow-400" :
+                  "bg-rose-400";
+                
+                return e('div', { key: i, className: "flex items-center gap-3" },
+                  e('span', { className: "text-base w-5" }, dim.emoji),
+                  e('div', { className: "flex-1" },
+                    e('div', { className: "flex justify-between items-center mb-0.5" },
+                      e('span', { className: "text-zinc-300 text-xs font-display font-semibold" }, dim.name),
+                      e('span', { className: "text-zinc-400 text-[10px] font-mono-d" }, 
+                        dim.status === "no_data" ? "—" : `${dim.score}/${dim.max}`
+                      )
+                    ),
+                    e('div', { className: "h-1.5 bg-zinc-800 rounded-full overflow-hidden" },
+                      e('div', { 
+                        className: `h-full rounded-full ${barColor} transition-all duration-700`,
+                        style: { width: `${pct}%` }
+                      })
+                    )
+                  )
+                );
+              })
+            ),
+            
+            // Top tip card
+            score.topTip && e('div', { 
+              className: "bg-white/5 border border-white/10 rounded-2xl p-3 flex items-start gap-3"
+            },
+              e('div', { className: "text-lg" }, "💡"),
+              e('div', { className: "flex-1" },
+                e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-0.5" }, 
+                  `Boost ${score.topTip.name.toLowerCase()}`
+                ),
+                e('p', { className: "text-white text-xs font-display leading-snug" }, score.topTip.tip)
+              )
+            ),
+            
+            // No-data nudge
+            !score.topTip && score.dimensions.filter(d => d.status === "no_data").length > 0 && e('div', { 
+              className: "bg-white/5 border border-white/10 rounded-2xl p-3 flex items-start gap-3"
+            },
+              e('div', { className: "text-lg" }, "🌱"),
+              e('div', { className: "flex-1" },
+                e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-0.5" }, "Get started"),
+                e('p', { className: "text-white text-xs font-display leading-snug" }, 
+                  "Log sleep, weight, and workouts daily for the most accurate score"
+                )
+              )
+            )
+          )
+        );
+      })(),
+
       // Calories hero
       e('div', { className: "relative rounded-3xl bg-gradient-to-br from-emerald-500/20 via-zinc-900 to-zinc-900 p-6 mb-4 overflow-hidden border border-white/5" },
         e('div', { className: "absolute -top-20 -right-20 w-48 h-48 bg-emerald-500/20 rounded-full blur-3xl" }),
@@ -2282,7 +2724,11 @@ const App = () => {
                 e('div', { className: "flex items-center gap-2 flex-wrap" },
                   e('p', { className: "text-white text-sm font-display font-semibold" }, w.name),
                   w.fromStrong && e('span', { className: "text-[9px] bg-orange-500/20 text-orange-300 px-1.5 py-0.5 rounded font-mono-d uppercase" }, "Strong"),
-                  w.prCount > 0 && e('span', { className: "text-[9px] bg-yellow-500/20 text-yellow-300 px-1.5 py-0.5 rounded font-mono-d" }, `${w.prCount} PR`)
+                  w.prCount > 0 && e('span', { className: "text-[9px] bg-yellow-500/20 text-yellow-300 px-1.5 py-0.5 rounded font-mono-d" }, `${w.prCount} PR`),
+                  w.energyLevel && e('span', { className: "text-[9px] bg-zinc-800 text-zinc-300 px-1.5 py-0.5 rounded font-mono-d flex items-center gap-0.5" }, 
+                    w.energyLevel <= 2 ? "😩" : w.energyLevel === 3 ? "😐" : w.energyLevel === 4 ? "😊" : "🔥",
+                    `${w.energyLevel}/5`
+                  )
                 ),
                 e('p', { className: "text-zinc-500 text-xs font-mono-d" }, 
                   `${w.time} · ${w.duration}min · ${w.kcal} kcal`
@@ -2495,7 +2941,11 @@ const App = () => {
                 e('div', { className: "flex items-center gap-2 flex-wrap" },
                   e('p', { className: "text-white font-display font-semibold" }, w.name),
                   w.fromStrong && e('span', { className: "text-[9px] bg-orange-500/20 text-orange-300 px-1.5 py-0.5 rounded font-mono-d uppercase" }, "Strong"),
-                  w.prCount > 0 && e('span', { className: "text-[9px] bg-yellow-500/20 text-yellow-300 px-1.5 py-0.5 rounded font-mono-d" }, `${w.prCount} PR`)
+                  w.prCount > 0 && e('span', { className: "text-[9px] bg-yellow-500/20 text-yellow-300 px-1.5 py-0.5 rounded font-mono-d" }, `${w.prCount} PR`),
+                  w.energyLevel && e('span', { className: "text-[9px] bg-zinc-800 text-zinc-300 px-1.5 py-0.5 rounded font-mono-d flex items-center gap-0.5" }, 
+                    w.energyLevel <= 2 ? "😩" : w.energyLevel === 3 ? "😐" : w.energyLevel === 4 ? "😊" : "🔥",
+                    `${w.energyLevel}/5`
+                  )
                 ),
                 e('div', { className: "flex gap-3 mt-1 flex-wrap" },
                   e('span', { className: "text-zinc-500 text-xs font-mono-d flex items-center gap-1" },
@@ -4721,6 +5171,41 @@ const EditWorkoutModal = ({ workout, bodyWeight, workoutHistory, trainingGoal, o
       onClick: () => { setKcalEdited(false); setW({ ...w, kcal: recalcKcal(w.duration) }); },
       className: "w-full bg-zinc-800 text-zinc-400 rounded-xl py-2 font-mono-d text-xs uppercase mb-4"
     }, "Reset to auto"),
+    
+    // ENERGY LEVEL (1-5)
+    e('div', { className: "bg-zinc-800 rounded-xl p-3 mb-3" },
+      e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2 flex items-center gap-1" }, 
+        e('span', null, "🔋"),
+        "Energy level during workout"
+      ),
+      e('div', { className: "grid grid-cols-5 gap-1.5" },
+        [
+          { v: 1, label: "Drained", emoji: "😩", activeClass: "bg-rose-500/30 border-2 border-rose-400" },
+          { v: 2, label: "Tired", emoji: "😴", activeClass: "bg-orange-500/30 border-2 border-orange-400" },
+          { v: 3, label: "Okay", emoji: "😐", activeClass: "bg-yellow-500/30 border-2 border-yellow-400" },
+          { v: 4, label: "Good", emoji: "😊", activeClass: "bg-cyan-500/30 border-2 border-cyan-400" },
+          { v: 5, label: "Peak", emoji: "🔥", activeClass: "bg-emerald-500/30 border-2 border-emerald-400" },
+        ].map(opt => 
+          e('button', {
+            key: opt.v,
+            onClick: () => setW({ ...w, energyLevel: opt.v }),
+            className: `rounded-lg py-2 px-1 flex flex-col items-center gap-0.5 transition active:scale-95 ${
+              w.energyLevel === opt.v 
+                ? opt.activeClass
+                : 'bg-zinc-900 border-2 border-transparent'
+            }`
+          },
+            e('span', { className: "text-lg" }, opt.emoji),
+            e('span', { 
+              className: `text-[9px] font-mono-d ${w.energyLevel === opt.v ? 'text-white' : 'text-zinc-500'}`
+            }, opt.label)
+          )
+        )
+      ),
+      w.energyLevel && e('p', { className: "text-[9px] text-zinc-600 font-mono-d text-center mt-2" }, 
+        `Logged: ${w.energyLevel}/5`
+      )
+    ),
     
     // Suggestions toggle (if any suggestions to show)
     suggestions.length > 0 && e('div', { className: "bg-gradient-to-br from-emerald-500/10 to-cyan-500/5 border border-emerald-500/20 rounded-xl p-3 mb-3" },
