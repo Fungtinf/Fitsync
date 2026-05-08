@@ -1,0 +1,1637 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="FitSync" />
+<meta name="theme-color" content="#000000" />
+<link rel="apple-touch-icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxODAgMTgwIj48cmVjdCB3aWR0aD0iMTgwIiBoZWlnaHQ9IjE4MCIgcng9IjQwIiBmaWxsPSIjMDAwIi8+PHRleHQgeD0iOTAiIHk9IjExNSIgZm9udC1zaXplPSI4MCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZmlsbD0iIzM0ZDM5OSI+RjwvdGV4dD48L3N2Zz4=" />
+<title>FitSync</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=DM+Mono:wght@400;500&display=swap');
+  * { -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none; }
+  html, body { 
+    font-family: 'Bricolage Grotesque', sans-serif; 
+    background: #000; 
+    color: white; 
+    overscroll-behavior: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  input, textarea { -webkit-user-select: text; user-select: text; }
+  .font-display { font-family: 'Bricolage Grotesque', sans-serif; }
+  .font-mono-d { font-family: 'DM Mono', monospace; }
+  .scrollbar-hide::-webkit-scrollbar { display: none; }
+  .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+  @keyframes shimmer { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
+  .animate-shimmer { animation: shimmer 2s ease-in-out infinite; }
+  @keyframes scan { 0% { transform: translateY(-100%); } 100% { transform: translateY(800%); } }
+  .animate-scan { animation: scan 1.8s ease-in-out infinite; }
+  @keyframes spin-slow { to { transform: rotate(360deg); } }
+  .animate-spin-slow { animation: spin-slow 1.5s linear infinite; }
+  @keyframes slide-up { from { transform: translateY(100%); } to { transform: translateY(0); } }
+  .slide-up { animation: slide-up 0.3s ease-out; }
+  /* Safe area for notch */
+  .pt-safe { padding-top: env(safe-area-inset-top); }
+  .pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="module">
+import React, { useState, useEffect, useRef } from "https://esm.sh/react@18";
+import { createRoot } from "https://esm.sh/react-dom@18/client";
+
+const e = React.createElement;
+const { useState: uS, useEffect: uE, useRef: uR } = React;
+
+// ============== STORAGE LAYER ==============
+const STORAGE_KEY = "fitsync_v1";
+
+const defaultData = {
+  caloriesGoal: 2400,
+  steps: 0,
+  stepsGoal: 10000,
+  water: 0,
+  waterGoal: 8,
+  bodyWeight: 75.0,
+  targetWeight: 72.0,
+  weightHistory: [],
+  meals: [],
+  workouts: [],
+  savedMeals: [
+    { id: 1, name: "Greek yogurt + berries", kcal: 320, emoji: "🥣", tag: "breakfast", protein: 22, carbs: 38, fats: 8 },
+    { id: 2, name: "Pre-workout snack", kcal: 220, emoji: "🍌", tag: "snack", protein: 8, carbs: 42, fats: 3 },
+  ],
+  lastDate: new Date().toDateString(),
+};
+
+const loadData = () => {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return { ...defaultData };
+    const parsed = JSON.parse(raw);
+    
+    // Daily reset for non-cumulative fields
+    if (parsed.lastDate !== new Date().toDateString()) {
+      parsed.meals = [];
+      parsed.workouts = [];
+      parsed.water = 0;
+      parsed.steps = 0;
+      parsed.lastDate = new Date().toDateString();
+    }
+    return { ...defaultData, ...parsed };
+  } catch (err) {
+    console.error("Load error:", err);
+    return { ...defaultData };
+  }
+};
+
+const saveData = (data) => {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch (err) {
+    console.error("Save error:", err);
+  }
+};
+
+// ============== STRONG OCR PARSER ==============
+// Parses raw OCR text from a Strong screenshot into structured workout data.
+// Rules:
+// 1. Exercise names are headers (capitalized lines, often ending in machine/cable/dumbbell)
+// 2. Sets follow format: "N WEIGHTkg × REPS" with optional 1RM number after
+// 3. Treadmill 1st entry = StairMaster (level × duration), 2nd+ = real treadmill
+// 4. Dedup by exact exercise name + same set values
+const parseStrongOCR = (rawText) => {
+  const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  
+  const exercises = [];
+  let currentExercise = null;
+  let workoutMeta = { name: "Workout", duration: 60, totalVolume: 0, prCount: 0 };
+  let treadmillCount = 0;
+  
+  // Try to find workout name (often "Pull", "Push", "Legs", "Upper", "Lower" near top)
+  for (const line of lines.slice(0, 5)) {
+    if (/^(Pull|Push|Legs|Upper|Lower|Full Body|Chest|Back|Arms|Shoulders|Cardio)$/i.test(line)) {
+      workoutMeta.name = line;
+      break;
+    }
+  }
+  
+  // Try to find duration like "2h 55m" or "1h 30m" or "45m"
+  for (const line of lines) {
+    const dm = line.match(/(\d+)h\s*(\d+)m/);
+    const mm = line.match(/^(\d+)m$/);
+    if (dm) {
+      workoutMeta.duration = parseInt(dm[1]) * 60 + parseInt(dm[2]);
+      break;
+    } else if (mm && parseInt(mm[1]) < 240) {
+      workoutMeta.duration = parseInt(mm[1]);
+      break;
+    }
+  }
+  
+  // Find total volume "14884 kg"
+  const volMatch = rawText.match(/(\d{3,6})\s*kg(?!\s*[×x])/);
+  if (volMatch) workoutMeta.totalVolume = parseInt(volMatch[1]);
+  
+  // Find PRs "9 PRs"
+  const prMatch = rawText.match(/(\d+)\s*PRs?/i);
+  if (prMatch) workoutMeta.prCount = parseInt(prMatch[1]);
+  
+  // Common Strong exercise keywords for header detection
+  const exerciseKeywords = /\b(row|press|curl|pulldown|fly|extension|raise|squat|deadlift|lunge|push.?up|pull.?up|crunch|machine|dumbbell|barbell|cable|gorilla|treadmill|running|cycling|elliptical|stairmaster|stair.?master|seated|standing|bench|incline|decline|hammer|preacher|tricep|bicep|lateral|frontal|reverse|hip|leg|calf|glute|chest|back|shoulder|abs|core|iso.?lateral)\b/i;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    
+    // Skip metadata lines
+    if (/^(Pull|Push|Legs|Upper|Lower|Cardio|^\d+:\d+|Saturday|Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|^\d+\s*(PRs?|kg|h|m)|1RM|VOL\.?|WEIGHT|Pace|Personal Records|^×$|^x$)/i.test(line)) continue;
+    
+    // Try to detect a set line: "1 72 kg × 7" or "1 72kg x 7"
+    const setMatch = line.match(/^(\d+)\s+([\d.]+)\s*kg\s*[×x]\s*(\d+)/i);
+    
+    // Treadmill/cardio entry: "1 9 km | 30:00" or "1 5 km | 25:30"
+    const cardioMatch = line.match(/^(\d+)\s+([\d.]+)\s*km\s*\|\s*(\d+):(\d+)/i);
+    
+    if (cardioMatch && currentExercise && /treadmill|running/i.test(currentExercise.name)) {
+      const setNum = parseInt(cardioMatch[1]);
+      const num1 = parseFloat(cardioMatch[2]);
+      const minutes = parseInt(cardioMatch[3]);
+      const seconds = parseInt(cardioMatch[4]);
+      const totalMin = minutes + (seconds / 60);
+      
+      treadmillCount++;
+      if (treadmillCount === 1) {
+        // First treadmill entry is StairMaster
+        // Convert: rename, store level + duration
+        if (currentExercise.name.toLowerCase().includes("treadmill") || currentExercise.name.toLowerCase().includes("running")) {
+          currentExercise.name = "StairMaster";
+          currentExercise.type = "stairmaster";
+        }
+        currentExercise.sets.push({
+          set: setNum,
+          level: num1, // first num = speed/level
+          duration: totalMin, // second num = time
+          display: `Level ${num1} · ${minutes}:${String(seconds).padStart(2,'0')}`,
+        });
+      } else {
+        // Real treadmill — first num = incline level, second = time
+        if (currentExercise.type === "stairmaster") {
+          // Create a new exercise for actual treadmill
+          if (currentExercise.sets.length > 0) exercises.push(currentExercise);
+          currentExercise = { name: "Treadmill (Run)", type: "treadmill", sets: [] };
+        }
+        currentExercise.sets.push({
+          set: setNum,
+          incline: num1,
+          duration: totalMin,
+          display: `Incline ${num1} · ${minutes}:${String(seconds).padStart(2,'0')}`,
+        });
+      }
+      continue;
+    }
+    
+    if (setMatch && currentExercise) {
+      const setNum = parseInt(setMatch[1]);
+      const weight = parseFloat(setMatch[2]);
+      const reps = parseInt(setMatch[3]);
+      
+      // Check for duplicate set (same set num + weight + reps in current exercise)
+      const isDup = currentExercise.sets.some(s => 
+        s.set === setNum && s.weight === weight && s.reps === reps
+      );
+      if (!isDup) {
+        currentExercise.sets.push({ set: setNum, weight, reps });
+      }
+      continue;
+    }
+    
+    // Header detection: contains exercise keyword and is mostly text
+    if (exerciseKeywords.test(line) && line.length > 3 && line.length < 60) {
+      // Strip trailing "1RM" or "Pace" etc.
+      const cleanName = line.replace(/\s*(1RM|Pace|VOL\.?|WEIGHT)\s*$/i, '').trim();
+      
+      // Skip if this looks like a label only
+      if (/^(1RM|Pace|VOL|WEIGHT)$/i.test(cleanName)) continue;
+      
+      // Check if exercise already exists (cross-screenshot dedup) — match by name
+      const existing = exercises.find(ex => ex.name.toLowerCase() === cleanName.toLowerCase());
+      if (existing) {
+        currentExercise = existing;
+      } else {
+        if (currentExercise && currentExercise.sets.length > 0) {
+          exercises.push(currentExercise);
+        }
+        currentExercise = { 
+          name: cleanName, 
+          type: /treadmill|running/i.test(cleanName) ? "treadmill" : "strength",
+          sets: [] 
+        };
+      }
+    }
+  }
+  
+  // Push final exercise
+  if (currentExercise && currentExercise.sets.length > 0) {
+    exercises.push(currentExercise);
+  }
+  
+  // Calculate kcal estimate using MET formula
+  // Strength: ~5.5 MET, Cardio higher
+  const bodyWeight = 75; // will be replaced by actual weight at call time
+  const totalMin = workoutMeta.duration;
+  const baseKcal = Math.round(5.5 * bodyWeight * (totalMin / 60));
+  
+  return {
+    name: workoutMeta.name,
+    duration: workoutMeta.duration,
+    totalVolume: workoutMeta.totalVolume,
+    prCount: workoutMeta.prCount,
+    estimatedKcal: baseKcal,
+    exercises,
+  };
+};
+
+// ============== MERGE TWO PARSED WORKOUTS (for multiple screenshots) ==============
+const mergeWorkouts = (existing, newOne) => {
+  if (!existing) return newOne;
+  const merged = { ...existing };
+  for (const newEx of newOne.exercises) {
+    const existingEx = merged.exercises.find(ex => 
+      ex.name.toLowerCase() === newEx.name.toLowerCase()
+    );
+    if (existingEx) {
+      // Merge sets, dedup
+      for (const s of newEx.sets) {
+        const dup = existingEx.sets.some(es => 
+          es.set === s.set && 
+          ((es.weight === s.weight && es.reps === s.reps) || 
+           (es.duration === s.duration && es.level === s.level))
+        );
+        if (!dup) existingEx.sets.push(s);
+      }
+      // Sort by set number
+      existingEx.sets.sort((a, b) => a.set - b.set);
+    } else {
+      merged.exercises.push(newEx);
+    }
+  }
+  return merged;
+};
+
+// ============== ICONS (inline SVG to avoid lib weight) ==============
+const Icon = ({ d, size = 20, className = "", fill = "none", stroke = "currentColor" }) => 
+  e('svg', { width: size, height: size, viewBox: "0 0 24 24", fill, stroke, strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round", className }, 
+    e('path', { d }));
+
+const icons = {
+  flame: "M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z",
+  footprints: "M4 16v-2.38c0-.4.18-.78.5-1.04.32-.26.74-.4 1.18-.4h.06c.62 0 1.18.34 1.5.88L8.4 14.6c.1.18.16.4.16.62 0 .78-.62 1.4-1.4 1.4H5.18c-.62 0-1.18-.34-1.5-.88M14 4v-.38c0-.4.18-.78.5-1.04.32-.26.74-.4 1.18-.4h.06c.62 0 1.18.34 1.5.88l.94 1.62c.1.18.16.4.16.62 0 .78-.62 1.4-1.4 1.4H15.5c-.62 0-1.18-.34-1.5-.88V4z",
+  heart: "M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z",
+  moon: "M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z",
+  drop: "M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z",
+  plus: "M12 5v14M5 12h14",
+  check: "M20 6 9 17l-5-5",
+  x: "M18 6 6 18M6 6l12 12",
+  trash: "M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2",
+  edit: "M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z",
+  camera: "M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z",
+  bookmark: "m19 21-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z",
+  star: "M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z",
+  target: "M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 4a6 6 0 1 0 6 6 6 6 0 0 0-6-6zm0 4a2 2 0 1 0 2 2 2 2 0 0 0-2-2z",
+  scale: "M3 7h18l-2 12H5L3 7zM9 7V5a3 3 0 0 1 6 0v2",
+  trending: "m3 17 6-6 4 4 8-8M14 7h7v7",
+  trophy: "M6 9H4.5a2.5 2.5 0 0 1 0-5H6m12 5h1.5a2.5 2.5 0 0 0 0-5H18m-6 14v3M9 22h6M6 4v6a6 6 0 0 0 12 0V4H6z",
+  dumbbell: "M14.4 14.4 9.6 9.6M18.657 21.485a2 2 0 1 1-2.829-2.828l-1.767 1.767a2 2 0 1 1-2.829-2.829l6.364-6.364a2 2 0 1 1 2.829 2.829l-1.768 1.767a2 2 0 1 1 2.828 2.829zM2.343 2.515a2 2 0 1 0 2.829 2.828l1.767-1.767a2 2 0 0 0-2.829-2.829",
+  apple: "M12 20.94c1.5 0 2.75-.5 3.75-1.5C17 18 18 16 18 14c0-3-2-5.5-5.5-5.5C9 8.5 8 11.5 8 13.5c0 1.5.5 3 1.5 4.5C10.5 19.5 11 20.94 12 20.94z",
+  activity: "M22 12h-4l-3 9L9 3l-3 9H2",
+  bell: "M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0",
+  image: "M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM8.5 11a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zm12 7-5-5L4 21",
+  clock: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2",
+  chevron: "m9 18 6-6-6-6",
+  bar: "M3 3v18h18M7 12v5M11 8v9M15 5v12M19 11v6",
+  trendDown: "m3 7 6 6 4-4 8 8M14 17h7v-7",
+  bulb: "M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.74V17h8v-2.26A7 7 0 0 0 12 2z",
+  sparkle: "M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1",
+};
+
+// ============== MAIN APP ==============
+const App = () => {
+  const [data, setData] = uS(loadData);
+  const [activeTab, setActiveTab] = uS("home");
+  
+  // Modals
+  const [modal, setModal] = uS(null);
+  const [editingMeal, setEditingMeal] = uS(null);
+  const [editingWorkout, setEditingWorkout] = uS(null);
+  const [importing, setImporting] = uS(false);
+  const [importProgress, setImportProgress] = uS(0);
+  const [importResult, setImportResult] = uS(null);
+  const [swipedMealId, setSwipedMealId] = uS(null);
+  
+  const fileInputRef = uR(null);
+  const touchStartX = uR(0);
+  
+  // Persist on every change
+  uE(() => { saveData(data); }, [data]);
+
+  const totalEaten = data.meals.reduce((s, m) => s + m.kcal, 0);
+  const totalBurned = data.workouts.reduce((s, w) => s + (w.kcal || 0), 0);
+  const caloriesLeft = data.caloriesGoal - totalEaten + totalBurned;
+  const calProgress = (totalEaten / data.caloriesGoal) * 100;
+  const stepProgress = (data.steps / data.stepsGoal) * 100;
+  const weightToGoal = (data.bodyWeight - data.targetWeight).toFixed(1);
+  const weightLost = data.weightHistory.length > 0 
+    ? (data.weightHistory[0].weight - data.bodyWeight).toFixed(1) 
+    : "0.0";
+
+  const updateData = (patch) => setData(prev => ({ ...prev, ...patch }));
+
+  // ============ HANDLERS ============
+  const handleScreenshotImport = async (files) => {
+    if (!files || files.length === 0) return;
+    setImporting(true);
+    setImportProgress(0);
+    
+    let mergedResult = null;
+    
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const baseProgress = (i / files.length) * 100;
+        
+        const result = await Tesseract.recognize(file, 'eng', {
+          logger: (m) => {
+            if (m.status === 'recognizing text') {
+              setImportProgress(baseProgress + (m.progress * 100 / files.length));
+            }
+          }
+        });
+        
+        const parsed = parseStrongOCR(result.data.text);
+        // Recalculate kcal with actual body weight
+        parsed.estimatedKcal = Math.round(5.5 * data.bodyWeight * (parsed.duration / 60));
+        mergedResult = mergeWorkouts(mergedResult, parsed);
+      }
+      
+      setImporting(false);
+      setImportResult(mergedResult);
+    } catch (err) {
+      console.error("OCR error:", err);
+      alert("Couldn't read the screenshot. Try a clearer image or log manually.");
+      setImporting(false);
+    }
+  };
+
+  const confirmImport = () => {
+    const newWorkout = {
+      id: Date.now(),
+      name: importResult.name,
+      duration: importResult.duration,
+      kcal: importResult.estimatedKcal,
+      time: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
+      icon: "🏋️",
+      fromStrong: true,
+      exercises: importResult.exercises,
+      totalVolume: importResult.totalVolume,
+      prCount: importResult.prCount,
+    };
+    updateData({ workouts: [...data.workouts, newWorkout] });
+    setImportResult(null);
+  };
+
+  const deleteMeal = (id) => {
+    updateData({ meals: data.meals.filter(m => m.id !== id) });
+    setSwipedMealId(null);
+  };
+
+  const deleteWorkout = (id) => {
+    updateData({ workouts: data.workouts.filter(w => w.id !== id) });
+  };
+
+  const addWater = (ml) => {
+    const glasses = ml / 250;
+    updateData({ water: Math.min(data.water + glasses, 30) });
+    setModal(null);
+  };
+
+  // ============ RENDER ============
+  return e('div', { className: "min-h-screen bg-black pb-20 pt-safe" },
+    
+    // Status header for non-PWA mode (subtle install hint)
+    !window.matchMedia('(display-mode: standalone)').matches && e('div', { 
+      className: "bg-emerald-500/10 border-b border-emerald-500/20 px-4 py-2 text-center text-xs text-emerald-300 font-mono-d"
+    }, "Tap Share → Add to Home Screen for the full app experience"),
+    
+    // ============ HOME TAB ============
+    activeTab === "home" && e('div', { className: "px-5 pt-4" },
+      
+      // Header
+      e('div', { className: "flex justify-between items-start mb-6" },
+        e('div', null,
+          e('p', { className: "text-zinc-500 text-sm font-mono-d uppercase tracking-wider" }, 
+            new Date().toLocaleDateString('en-US', { weekday: 'long' })
+          ),
+          e('h1', { className: "text-white text-3xl font-display font-bold leading-tight" }, 
+            "Today",
+            e('span', { className: "text-emerald-400" }, ".")
+          )
+        ),
+        e('div', { className: "w-11 h-11 rounded-full bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center text-white font-bold shadow-lg shadow-emerald-500/30" }, "F")
+      ),
+
+      // Weight goal banner
+      e('button', { 
+        onClick: () => setModal('weight'),
+        className: "w-full bg-gradient-to-r from-purple-500/20 via-pink-500/10 to-rose-500/20 rounded-2xl p-4 mb-4 border border-purple-500/20 flex items-center gap-3 active:scale-[0.98] transition text-left"
+      },
+        e('div', { className: "w-12 h-12 rounded-xl bg-purple-500/30 flex items-center justify-center" },
+          e(Icon, { d: icons.target, className: "text-purple-300" })
+        ),
+        e('div', { className: "flex-1" },
+          e('p', { className: "text-zinc-400 text-[10px] font-mono-d uppercase tracking-wider" }, "Weight goal"),
+          e('p', { className: "text-white font-display font-bold" },
+            `-${weightToGoal}kg `,
+            e('span', { className: "text-zinc-500 text-sm font-normal" }, `to reach ${data.targetWeight}kg`)
+          ),
+          parseFloat(weightLost) > 0 && e('div', { className: "flex items-center gap-1.5 mt-0.5" },
+            e(Icon, { d: icons.trendDown, size: 12, className: "text-emerald-400" }),
+            e('p', { className: "text-emerald-400 text-[10px] font-mono-d" }, `-${weightLost}kg lost`)
+          )
+        ),
+        e(Icon, { d: icons.chevron, size: 18, className: "text-zinc-500" })
+      ),
+
+      // Calories hero
+      e('div', { className: "relative rounded-3xl bg-gradient-to-br from-emerald-500/20 via-zinc-900 to-zinc-900 p-6 mb-4 overflow-hidden border border-white/5" },
+        e('div', { className: "absolute -top-20 -right-20 w-48 h-48 bg-emerald-500/20 rounded-full blur-3xl" }),
+        e('div', { className: "relative" },
+          e('div', { className: "flex justify-between items-start mb-4" },
+            e('div', null,
+              e('div', { className: "flex items-center gap-2 mb-1" },
+                e('p', { className: "text-zinc-400 text-xs font-mono-d uppercase tracking-widest" }, "Calories left"),
+                e('button', { 
+                  onClick: () => setModal('goal'),
+                  className: "w-5 h-5 rounded-full bg-white/5 flex items-center justify-center active:scale-90"
+                }, e(Icon, { d: icons.edit, size: 10, className: "text-zinc-400" }))
+              ),
+              e('div', { className: "flex items-baseline gap-2" },
+                e('span', { className: `text-5xl font-display font-bold ${caloriesLeft < 0 ? 'text-rose-400' : 'text-white'}` }, caloriesLeft),
+                e('span', { className: "text-zinc-500 text-sm font-mono-d" }, "kcal")
+              )
+            ),
+            e(Icon, { d: icons.flame, size: 28, className: "text-orange-400" })
+          ),
+          e('div', { className: "grid grid-cols-3 gap-3 mt-5" },
+            e('button', { onClick: () => setModal('goal'), className: "bg-black/40 rounded-2xl p-3 active:scale-95 transition text-left" },
+              e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-1" }, "Goal"),
+              e('p', { className: "text-white font-display font-semibold" }, data.caloriesGoal)
+            ),
+            e('div', { className: "bg-black/40 rounded-2xl p-3" },
+              e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-1" }, "Eaten"),
+              e('p', { className: "text-cyan-300 font-display font-semibold" }, totalEaten)
+            ),
+            e('div', { className: "bg-black/40 rounded-2xl p-3" },
+              e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-1" }, "Burned"),
+              e('p', { className: "text-orange-300 font-display font-semibold" }, totalBurned)
+            )
+          ),
+          e('div', { className: "mt-4" },
+            e('div', { className: "h-2 bg-black/50 rounded-full overflow-hidden" },
+              e('div', { 
+                className: `h-full rounded-full transition-all duration-700 ${calProgress > 100 ? 'bg-gradient-to-r from-orange-400 to-rose-400' : 'bg-gradient-to-r from-emerald-400 to-cyan-400'}`,
+                style: { width: `${Math.min(calProgress, 100)}%` }
+              })
+            )
+          )
+        )
+      ),
+
+      // Quick actions
+      e('div', { className: "grid grid-cols-2 gap-3 mb-4" },
+        e('button', { 
+          onClick: () => setModal('savedMeals'),
+          className: "bg-gradient-to-br from-cyan-500/20 to-emerald-500/10 rounded-2xl p-4 border border-cyan-500/20 active:scale-[0.97] text-left"
+        },
+          e(Icon, { d: icons.bookmark, size: 18, className: "text-cyan-400 mb-2" }),
+          e('p', { className: "text-white font-display font-semibold text-sm" }, "Quick meal"),
+          e('p', { className: "text-zinc-500 text-[10px] font-mono-d" }, `${data.savedMeals.length} saved`)
+        ),
+        e('button', { 
+          onClick: () => fileInputRef.current?.click(),
+          className: "bg-gradient-to-br from-orange-500/20 to-rose-500/10 rounded-2xl p-4 border border-orange-500/20 active:scale-[0.97] text-left"
+        },
+          e(Icon, { d: icons.camera, size: 18, className: "text-orange-400 mb-2" }),
+          e('p', { className: "text-white font-display font-semibold text-sm" }, "Import workout"),
+          e('p', { className: "text-zinc-500 text-[10px] font-mono-d" }, "From Strong screenshot")
+        )
+      ),
+
+      // Stats grid
+      e('div', { className: "grid grid-cols-2 gap-3 mb-4" },
+        // Steps
+        e('button', { 
+          onClick: () => setModal('steps'),
+          className: "bg-zinc-900/80 rounded-2xl p-4 border border-white/5 active:scale-[0.97] text-left"
+        },
+          e('div', { className: "flex justify-between items-start mb-3" },
+            e(Icon, { d: icons.footprints, className: "text-emerald-400" }),
+            e('span', { className: "text-[10px] text-zinc-500 font-mono-d" }, `${Math.round(stepProgress)}%`)
+          ),
+          e('p', { className: "text-white text-2xl font-display font-bold" }, data.steps.toLocaleString()),
+          e('p', { className: "text-zinc-500 text-xs font-mono-d" }, `/ ${data.stepsGoal.toLocaleString()} steps`),
+          e('div', { className: "h-1 bg-zinc-800 rounded-full mt-2 overflow-hidden" },
+            e('div', { className: "h-full bg-emerald-400 rounded-full", style: { width: `${Math.min(stepProgress, 100)}%` } })
+          ),
+          e('p', { className: "text-[9px] text-zinc-600 font-mono-d mt-1.5 flex items-center gap-1" },
+            e(Icon, { d: icons.edit, size: 8 }),
+            "tap to edit"
+          )
+        ),
+        // Water
+        e('button', { 
+          onClick: () => setModal('water'),
+          className: "bg-zinc-900/80 rounded-2xl p-4 border border-white/5 active:scale-[0.97] text-left"
+        },
+          e('div', { className: "flex justify-between items-start mb-3" },
+            e(Icon, { d: icons.drop, className: "text-cyan-400" }),
+            e('span', { className: "text-[10px] text-zinc-500 font-mono-d" }, `${Math.round(data.water)}/${data.waterGoal}`)
+          ),
+          e('p', { className: "text-white text-2xl font-display font-bold" }, 
+            (data.water * 0.25).toFixed(2),
+            e('span', { className: "text-base text-zinc-500" }, "L")
+          ),
+          e('div', { className: "flex gap-1 mt-2" },
+            Array(data.waterGoal).fill(0).map((_, i) => 
+              e('div', { key: i, className: `flex-1 h-1.5 rounded-full ${i < data.water ? 'bg-cyan-400' : 'bg-zinc-800'}` })
+            )
+          ),
+          e('p', { className: "text-[9px] text-zinc-600 font-mono-d mt-1.5 flex items-center gap-1" },
+            e(Icon, { d: icons.plus, size: 8 }),
+            "tap to log"
+          )
+        )
+      ),
+
+      // Body weight panel
+      e('button', { 
+        onClick: () => setModal('weight'),
+        className: "w-full bg-zinc-900/80 rounded-2xl p-4 mb-4 border border-white/5 active:scale-[0.98] flex items-center gap-3 text-left"
+      },
+        e('div', { className: "w-12 h-12 rounded-xl bg-purple-500/20 flex items-center justify-center" },
+          e(Icon, { d: icons.scale, className: "text-purple-300" })
+        ),
+        e('div', { className: "flex-1" },
+          e('p', { className: "text-zinc-400 text-[10px] font-mono-d uppercase tracking-wider" }, "Current weight"),
+          e('p', { className: "text-white text-2xl font-display font-bold" }, 
+            data.bodyWeight,
+            e('span', { className: "text-sm text-zinc-500" }, " kg")
+          )
+        ),
+        e('div', { className: "text-right" },
+          e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "log weekly"),
+          e(Icon, { d: icons.plus, size: 16, className: "text-zinc-500 ml-auto" })
+        )
+      ),
+
+      // Today's training
+      data.workouts.length > 0 && e('div', { className: "mb-4" },
+        e('h2', { className: "text-white font-display font-semibold mb-3" }, "Today's training"),
+        e('div', { className: "space-y-2" },
+          data.workouts.map((w) => e('button', { 
+            key: w.id,
+            onClick: () => setEditingWorkout(w),
+            className: "w-full bg-zinc-900/80 rounded-2xl p-3.5 border border-white/5 text-left active:scale-[0.98]"
+          },
+            e('div', { className: "flex items-center gap-3" },
+              e('div', { className: "w-11 h-11 rounded-xl bg-zinc-800 flex items-center justify-center text-xl" }, w.icon),
+              e('div', { className: "flex-1" },
+                e('div', { className: "flex items-center gap-2 flex-wrap" },
+                  e('p', { className: "text-white text-sm font-display font-semibold" }, w.name),
+                  w.fromStrong && e('span', { className: "text-[9px] bg-orange-500/20 text-orange-300 px-1.5 py-0.5 rounded font-mono-d uppercase" }, "Strong"),
+                  w.prCount > 0 && e('span', { className: "text-[9px] bg-yellow-500/20 text-yellow-300 px-1.5 py-0.5 rounded font-mono-d" }, `${w.prCount} PR`)
+                ),
+                e('p', { className: "text-zinc-500 text-xs font-mono-d" }, 
+                  `${w.time} · ${w.duration}min · ${w.kcal} kcal`
+                )
+              ),
+              e(Icon, { d: icons.edit, size: 14, className: "text-zinc-600" })
+            )
+          ))
+        )
+      ),
+
+      // Hidden file input
+      e('input', {
+        ref: fileInputRef,
+        type: "file",
+        accept: "image/*",
+        multiple: true,
+        capture: "environment",
+        onChange: (ev) => handleScreenshotImport(ev.target.files),
+        style: { display: 'none' }
+      })
+    ),
+
+    // ============ FOOD TAB ============
+    activeTab === "food" && e('div', { className: "px-5 pt-4" },
+      e('div', { className: "flex justify-between items-start mb-6" },
+        e('div', null,
+          e('p', { className: "text-zinc-500 text-sm font-mono-d uppercase tracking-wider" }, "Nutrition"),
+          e('h1', { className: "text-white text-3xl font-display font-bold" }, "Today's meals")
+        ),
+        e('div', { className: "flex gap-2" },
+          e('button', { 
+            onClick: () => setModal('savedMeals'),
+            className: "w-11 h-11 rounded-full bg-cyan-400 flex items-center justify-center text-black active:scale-95 shadow-lg"
+          }, e(Icon, { d: icons.bookmark, size: 18, stroke: "black" })),
+          e('button', { 
+            onClick: () => setModal('addMeal'),
+            className: "w-11 h-11 rounded-full bg-emerald-400 flex items-center justify-center text-black active:scale-95 shadow-lg"
+          }, e(Icon, { d: icons.plus, size: 20, stroke: "black" }))
+        )
+      ),
+
+      e('div', { className: "bg-gradient-to-br from-cyan-500/20 to-emerald-500/10 rounded-3xl p-5 mb-5 border border-white/5" },
+        e('div', { className: "flex justify-between items-center mb-2" },
+          e('span', { className: "text-zinc-400 text-xs font-mono-d uppercase" }, "Eaten today"),
+          e('span', { className: "text-zinc-400 text-xs font-mono-d" }, `${Math.round(calProgress)}%`)
+        ),
+        e('div', { className: "flex items-baseline gap-2 mb-3" },
+          e('span', { className: "text-white text-4xl font-display font-bold" }, totalEaten),
+          e('span', { className: "text-zinc-500" }, `/ ${data.caloriesGoal} kcal`)
+        ),
+        e('div', { className: "h-2 bg-black/40 rounded-full overflow-hidden" },
+          e('div', { 
+            className: `h-full ${calProgress > 100 ? 'bg-gradient-to-r from-orange-400 to-rose-400' : 'bg-gradient-to-r from-cyan-400 to-emerald-400'}`,
+            style: { width: `${Math.min(calProgress, 100)}%` }
+          })
+        )
+      ),
+
+      data.savedMeals.length > 0 && e('div', { className: "mb-5" },
+        e('div', { className: "flex items-center justify-between mb-2" },
+          e('h3', { className: "text-white font-display font-semibold text-sm flex items-center gap-1.5" },
+            e(Icon, { d: icons.star, size: 14, className: "text-yellow-400", fill: "currentColor" }),
+            "Your favorites"
+          ),
+          e('span', { className: "text-[10px] text-zinc-500 font-mono-d" }, "TAP TO ADD")
+        ),
+        e('div', { className: "flex gap-2 overflow-x-auto scrollbar-hide -mx-5 px-5 pb-2" },
+          data.savedMeals.map(m => e('button', { 
+            key: m.id,
+            onClick: () => {
+              const t = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+              updateData({ meals: [...data.meals, { ...m, id: Date.now(), time: t, saved: true }] });
+            },
+            className: "flex-shrink-0 w-32 bg-zinc-900/80 rounded-2xl p-3 border border-white/5 active:scale-95 text-left"
+          },
+            e('div', { className: "text-2xl mb-1" }, m.emoji),
+            e('p', { className: "text-white text-xs font-display font-semibold leading-tight line-clamp-2" }, m.name),
+            e('div', { className: "flex justify-between items-end mt-2" },
+              e('span', { className: "text-emerald-400 text-xs font-display font-bold" }, m.kcal),
+              e('span', { className: "text-zinc-600 text-[9px] font-mono-d uppercase" }, m.tag)
+            )
+          ))
+        )
+      ),
+
+      e('div', { className: "flex justify-between items-center mb-2" },
+        e('h3', { className: "text-white font-display font-semibold text-sm" }, "Logged today"),
+        data.meals.length > 0 && e('span', { className: "text-[10px] text-zinc-500 font-mono-d" }, "SWIPE LEFT TO DELETE")
+      ),
+      data.meals.length === 0 ? 
+        e('p', { className: "text-zinc-600 text-sm text-center py-8 font-mono-d" }, "No meals logged yet today") :
+        e('div', { className: "space-y-2" },
+          data.meals.map((m) => e('div', { 
+            key: m.id,
+            className: "relative overflow-hidden rounded-2xl",
+            onTouchStart: (ev) => touchStartX.current = ev.touches[0].clientX,
+            onTouchEnd: (ev) => {
+              const diff = touchStartX.current - ev.changedTouches[0].clientX;
+              if (diff > 50) setSwipedMealId(m.id);
+              else if (diff < -20) setSwipedMealId(null);
+            }
+          },
+            e('div', { className: "absolute inset-y-0 right-0 w-24 bg-gradient-to-r from-rose-600 to-rose-500 flex items-center justify-center" },
+              e('button', { 
+                onClick: () => deleteMeal(m.id),
+                className: "text-white flex flex-col items-center gap-1"
+              },
+                e(Icon, { d: icons.trash, size: 20 }),
+                e('span', { className: "text-[10px] font-mono-d uppercase" }, "Delete")
+              )
+            ),
+            e('button', { 
+              onClick: () => {
+                if (swipedMealId === m.id) setSwipedMealId(null);
+                else setEditingMeal(m);
+              },
+              className: `relative bg-zinc-900 rounded-2xl p-3.5 flex items-center gap-3 border border-white/5 transition-transform duration-200 w-full text-left ${swipedMealId === m.id ? '-translate-x-24' : 'translate-x-0'}`
+            },
+              e('div', { className: "w-11 h-11 rounded-xl bg-zinc-800 flex items-center justify-center text-2xl" }, m.emoji),
+              e('div', { className: "flex-1" },
+                e('div', { className: "flex items-center gap-1.5" },
+                  e('p', { className: "text-white text-sm font-display font-semibold" }, m.name),
+                  m.saved && e(Icon, { d: icons.star, size: 10, className: "text-yellow-400", fill: "currentColor" })
+                ),
+                e('p', { className: "text-zinc-500 text-xs font-mono-d" }, m.time)
+              ),
+              e('div', { className: "text-right" },
+                e('p', { className: "text-emerald-400 font-display font-semibold" }, m.kcal),
+                e('p', { className: "text-zinc-600 text-[10px] font-mono-d" }, "kcal")
+              )
+            )
+          ))
+        )
+    ),
+
+    // ============ TRAINING TAB ============
+    activeTab === "training" && e('div', { className: "px-5 pt-4" },
+      e('div', { className: "flex justify-between items-start mb-6" },
+        e('div', null,
+          e('p', { className: "text-zinc-500 text-sm font-mono-d uppercase tracking-wider" }, "Training"),
+          e('h1', { className: "text-white text-3xl font-display font-bold" }, "Sessions")
+        ),
+        e('button', { 
+          onClick: () => fileInputRef.current?.click(),
+          className: "w-11 h-11 rounded-full bg-orange-400 flex items-center justify-center text-black active:scale-95 shadow-lg"
+        }, e(Icon, { d: icons.camera, size: 18, stroke: "black" }))
+      ),
+
+      e('div', { className: "bg-gradient-to-br from-orange-500/20 to-rose-500/10 rounded-3xl p-5 mb-5 border border-white/5" },
+        e('div', { className: "grid grid-cols-3 gap-3" },
+          e('div', null,
+            e('p', { className: "text-[10px] text-zinc-400 font-mono-d uppercase mb-1" }, "Burned"),
+            e('p', { className: "text-white text-2xl font-display font-bold" }, totalBurned)
+          ),
+          e('div', null,
+            e('p', { className: "text-[10px] text-zinc-400 font-mono-d uppercase mb-1" }, "Sessions"),
+            e('p', { className: "text-white text-2xl font-display font-bold" }, data.workouts.length)
+          ),
+          e('div', null,
+            e('p', { className: "text-[10px] text-zinc-400 font-mono-d uppercase mb-1" }, "Volume"),
+            e('p', { className: "text-white text-2xl font-display font-bold" }, 
+              `${(data.workouts.reduce((s, w) => s + (w.totalVolume || 0), 0) / 1000).toFixed(1)}t`
+            )
+          )
+        )
+      ),
+
+      data.workouts.length === 0 ? 
+        e('div', { className: "text-center py-12" },
+          e('p', { className: "text-zinc-600 text-sm font-mono-d mb-3" }, "No workouts logged yet"),
+          e('button', { 
+            onClick: () => fileInputRef.current?.click(),
+            className: "bg-orange-400 text-black rounded-xl px-5 py-3 font-display font-semibold active:scale-95"
+          }, "Import from Strong")
+        ) :
+        e('div', { className: "space-y-2" },
+          data.workouts.map((w) => e('button', { 
+            key: w.id,
+            onClick: () => setEditingWorkout(w),
+            className: "w-full bg-zinc-900/80 rounded-2xl p-4 border border-white/5 text-left active:scale-[0.98]"
+          },
+            e('div', { className: "flex items-center gap-3 mb-2" },
+              e('div', { className: "w-12 h-12 rounded-xl bg-zinc-800 flex items-center justify-center text-2xl" }, w.icon),
+              e('div', { className: "flex-1" },
+                e('div', { className: "flex items-center gap-2 flex-wrap" },
+                  e('p', { className: "text-white font-display font-semibold" }, w.name),
+                  w.fromStrong && e('span', { className: "text-[9px] bg-orange-500/20 text-orange-300 px-1.5 py-0.5 rounded font-mono-d uppercase" }, "Strong"),
+                  w.prCount > 0 && e('span', { className: "text-[9px] bg-yellow-500/20 text-yellow-300 px-1.5 py-0.5 rounded font-mono-d" }, `${w.prCount} PR`)
+                ),
+                e('div', { className: "flex gap-3 mt-1 flex-wrap" },
+                  e('span', { className: "text-zinc-500 text-xs font-mono-d flex items-center gap-1" },
+                    e(Icon, { d: icons.clock, size: 10 }),
+                    w.time
+                  ),
+                  e('span', { className: "text-zinc-500 text-xs font-mono-d" }, `${w.duration}min`),
+                  e('span', { className: "text-orange-400 text-xs font-mono-d" }, `${w.kcal} kcal`)
+                )
+              ),
+              e(Icon, { d: icons.edit, size: 14, className: "text-zinc-600" })
+            ),
+            w.exercises && w.exercises.length > 0 && e('div', { className: "mt-3 pt-3 border-t border-white/5 space-y-1.5" },
+              w.exercises.slice(0, 4).map((ex, j) => e('div', { key: j, className: "flex justify-between text-xs" },
+                e('span', { className: "text-zinc-300 font-display flex-1 truncate pr-2" }, ex.name),
+                e('span', { className: "text-zinc-500 font-mono-d" }, `${ex.sets.length} sets`)
+              )),
+              w.exercises.length > 4 && e('p', { className: "text-[10px] text-zinc-600 font-mono-d" }, 
+                `+${w.exercises.length - 4} more`
+              )
+            )
+          ))
+        )
+    ),
+
+    // ============ TRENDS TAB ============
+    activeTab === "trends" && e('div', { className: "px-5 pt-4" },
+      e('div', { className: "mb-6" },
+        e('p', { className: "text-zinc-500 text-sm font-mono-d uppercase tracking-wider" }, "Insights"),
+        e('h1', { className: "text-white text-3xl font-display font-bold" }, "Your trends")
+      ),
+
+      // Weight chart
+      e('div', { className: "bg-zinc-900/80 rounded-3xl p-5 mb-4 border border-white/5" },
+        e('div', { className: "flex justify-between items-start mb-4" },
+          e('div', null,
+            e('h3', { className: "text-white font-display font-semibold flex items-center gap-2" },
+              e(Icon, { d: icons.scale, size: 16, className: "text-purple-400" }),
+              "Weight progression"
+            ),
+            e('p', { className: "text-zinc-500 text-xs font-mono-d uppercase mt-1" }, 
+              `${data.weightHistory.length} entries`
+            )
+          ),
+          e('button', { 
+            onClick: () => setModal('weight'),
+            className: "bg-purple-500/20 text-purple-300 rounded-lg px-2.5 py-1 text-[10px] font-mono-d uppercase active:scale-95"
+          }, "+ log")
+        ),
+        
+        data.weightHistory.length < 2 ? 
+          e('p', { className: "text-zinc-600 text-sm text-center py-8 font-mono-d" }, 
+            data.weightHistory.length === 0 ? "Log your weight to see trends" : "Need at least 2 entries"
+          ) :
+          renderWeightChart(data, weightToGoal, weightLost)
+      ),
+
+      // Stats cards
+      e('div', { className: "grid grid-cols-2 gap-3" },
+        e('div', { className: "bg-zinc-900/80 rounded-2xl p-4 border border-white/5" },
+          e(Icon, { d: icons.dumbbell, size: 18, className: "text-orange-400 mb-2" }),
+          e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase" }, "Total workouts"),
+          e('p', { className: "text-white text-2xl font-display font-bold" }, data.workouts.length)
+        ),
+        e('div', { className: "bg-zinc-900/80 rounded-2xl p-4 border border-white/5" },
+          e(Icon, { d: icons.flame, size: 18, className: "text-rose-400 mb-2" }),
+          e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase" }, "Burned today"),
+          e('p', { className: "text-white text-2xl font-display font-bold" }, totalBurned)
+        )
+      )
+    ),
+
+    // ============ MODALS ============
+    
+    // Water modal
+    modal === 'water' && e(Modal, { onClose: () => setModal(null), title: "Log water" },
+      e('p', { className: "text-zinc-500 text-sm mb-5" }, 
+        `Currently ${(data.water * 0.25).toFixed(2)}L of ${(data.waterGoal * 0.25).toFixed(2)}L`
+      ),
+      e('div', { className: "grid grid-cols-2 gap-3 mb-3" },
+        e(WaterButton, { ml: 300, onClick: () => addWater(300), emoji: "🥛", label: "Glass" }),
+        e(WaterButton, { ml: 500, onClick: () => addWater(500), emoji: "🍶", label: "Bottle" })
+      ),
+      e('div', { className: "grid grid-cols-2 gap-3 mb-4" },
+        e('button', { 
+          onClick: () => addWater(750),
+          className: "bg-zinc-800 rounded-2xl p-4 active:scale-95"
+        },
+          e('p', { className: "text-white font-display font-semibold text-sm" }, "Large bottle"),
+          e('p', { className: "text-zinc-400 text-xs font-mono-d" }, "750 ml")
+        ),
+        e('button', { 
+          onClick: () => addWater(150),
+          className: "bg-zinc-800 rounded-2xl p-4 active:scale-95"
+        },
+          e('p', { className: "text-white font-display font-semibold text-sm" }, "Small cup"),
+          e('p', { className: "text-zinc-400 text-xs font-mono-d" }, "150 ml")
+        )
+      ),
+      e('button', { 
+        onClick: () => setModal(null),
+        className: "w-full bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+      }, "Cancel")
+    ),
+    
+    // Steps modal
+    modal === 'steps' && e(StepsModal, { 
+      data, 
+      onClose: () => setModal(null), 
+      onSave: (s) => { updateData({ steps: s }); setModal(null); }
+    }),
+    
+    // Goal modal
+    modal === 'goal' && e(GoalModal, { 
+      data, 
+      onClose: () => setModal(null), 
+      onSave: (g) => { updateData({ caloriesGoal: g }); setModal(null); }
+    }),
+    
+    // Weight modal
+    modal === 'weight' && e(WeightModal, { 
+      data, 
+      onClose: () => setModal(null), 
+      onSave: (w) => { 
+        const entry = { weight: w, date: new Date().toISOString() };
+        updateData({ 
+          bodyWeight: w, 
+          weightHistory: [...data.weightHistory, entry] 
+        }); 
+        setModal(null); 
+      }
+    }),
+    
+    // Saved meals modal
+    modal === 'savedMeals' && e(Modal, { onClose: () => setModal(null), title: "Quick add", subtitle: "Tap any to log instantly" },
+      data.savedMeals.length === 0 ? 
+        e('p', { className: "text-zinc-600 text-sm text-center py-8" }, "No saved meals yet. Add one with the + button.") :
+        e('div', { className: "space-y-2 max-h-96 overflow-y-auto scrollbar-hide" },
+          data.savedMeals.map(m => e('button', { 
+            key: m.id,
+            onClick: () => {
+              const t = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+              updateData({ meals: [...data.meals, { ...m, id: Date.now(), time: t, saved: true }] });
+              setModal(null);
+            },
+            className: "w-full bg-zinc-800 rounded-2xl p-3.5 flex items-center gap-3 active:scale-[0.98]"
+          },
+            e('div', { className: "w-11 h-11 rounded-xl bg-zinc-700 flex items-center justify-center text-2xl" }, m.emoji),
+            e('div', { className: "flex-1 text-left" },
+              e('p', { className: "text-white text-sm font-display font-semibold" }, m.name),
+              e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase" }, 
+                `${m.tag} · ${m.protein}P · ${m.carbs}C · ${m.fats}F`
+              )
+            ),
+            e('div', { className: "text-right" },
+              e('p', { className: "text-emerald-400 font-display font-bold" }, m.kcal),
+              e('p', { className: "text-zinc-600 text-[10px] font-mono-d" }, "kcal")
+            )
+          ))
+        )
+    ),
+    
+    // Add meal modal
+    modal === 'addMeal' && e(AddMealModal, { 
+      onClose: () => setModal(null),
+      onSave: (meal, saveAsTemplate) => {
+        const t = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+        const newMeal = { ...meal, id: Date.now(), time: t };
+        const updates = { meals: [...data.meals, newMeal] };
+        if (saveAsTemplate) {
+          updates.savedMeals = [...data.savedMeals, { 
+            ...meal, id: Date.now() + 1, tag: "custom", protein: 0, carbs: 0, fats: 0 
+          }];
+        }
+        updateData(updates);
+        setModal(null);
+      }
+    }),
+    
+    // Edit meal modal
+    editingMeal && e(EditMealModal, {
+      meal: editingMeal,
+      onClose: () => setEditingMeal(null),
+      onSave: (updated) => {
+        updateData({ 
+          meals: data.meals.map(m => m.id === updated.id ? updated : m)
+        });
+        setEditingMeal(null);
+      },
+      onDelete: () => {
+        deleteMeal(editingMeal.id);
+        setEditingMeal(null);
+      }
+    }),
+    
+    // Edit workout modal
+    editingWorkout && e(EditWorkoutModal, {
+      workout: editingWorkout,
+      onClose: () => setEditingWorkout(null),
+      onSave: (updated) => {
+        updateData({ 
+          workouts: data.workouts.map(w => w.id === updated.id ? updated : w)
+        });
+        setEditingWorkout(null);
+      },
+      onDelete: () => {
+        deleteWorkout(editingWorkout.id);
+        setEditingWorkout(null);
+      }
+    }),
+    
+    // Importing overlay
+    importing && e('div', { className: "fixed inset-0 bg-black/95 backdrop-blur-md z-[60] flex items-center justify-center" },
+      e('div', { className: "text-center px-8" },
+        e('div', { className: "relative w-32 h-40 mx-auto mb-6 bg-zinc-900 rounded-2xl border-2 border-orange-400/50 overflow-hidden" },
+          e('div', { className: "absolute inset-x-0 h-1 bg-gradient-to-r from-transparent via-orange-400 to-transparent animate-scan" }),
+          e('div', { className: "p-3 space-y-1.5" },
+            [3,4,2,4,3,3,4,2].map((w, i) => 
+              e('div', { key: i, className: "h-1.5 bg-zinc-700 rounded", style: { width: `${w*20}%` } })
+            )
+          )
+        ),
+        e('p', { className: "text-white font-display font-semibold mb-1" }, "Reading screenshot..."),
+        e('p', { className: "text-orange-400 text-xs font-mono-d mb-2" }, `${Math.round(importProgress)}%`),
+        e('div', { className: "w-48 h-1 bg-zinc-800 rounded-full overflow-hidden mx-auto" },
+          e('div', { className: "h-full bg-orange-400 transition-all", style: { width: `${importProgress}%` } })
+        ),
+        e('p', { className: "text-zinc-500 text-[10px] font-mono-d mt-3 uppercase" }, "OCR processing locally")
+      )
+    ),
+    
+    // Import result modal
+    importResult && e(ImportResultModal, {
+      result: importResult,
+      onConfirm: confirmImport,
+      onCancel: () => setImportResult(null),
+      bodyWeight: data.bodyWeight,
+    }),
+
+    // ============ BOTTOM NAV ============
+    e('div', { className: "fixed bottom-0 left-0 right-0 bg-black/95 backdrop-blur-xl border-t border-white/5 px-2 py-2 pb-safe z-40" },
+      e('div', { className: "flex justify-around items-center" },
+        [
+          { id: 'home', d: icons.activity, label: 'Home' },
+          { id: 'food', d: icons.apple, label: 'Food' },
+          { id: 'training', d: icons.dumbbell, label: 'Train' },
+          { id: 'trends', d: icons.bar, label: 'Trends' },
+        ].map(t => {
+          const active = activeTab === t.id;
+          return e('button', { 
+            key: t.id,
+            onClick: () => { setActiveTab(t.id); setSwipedMealId(null); },
+            className: `flex flex-col items-center gap-1 px-4 py-2 rounded-2xl transition ${active ? 'bg-white/5' : ''}`
+          },
+            e(Icon, { d: t.d, size: 20, className: active ? 'text-emerald-400' : 'text-zinc-500' }),
+            e('span', { 
+              className: `text-[10px] font-mono-d ${active ? 'text-white' : 'text-zinc-600'}` 
+            }, t.label)
+          );
+        })
+      )
+    )
+  );
+};
+
+// ============ MODAL COMPONENTS ============
+const Modal = ({ onClose, title, subtitle, children }) => 
+  e('div', { 
+    className: "fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-end",
+    onClick: onClose
+  },
+    e('div', { 
+      className: "w-full bg-zinc-900 rounded-t-3xl p-6 border-t border-white/10 slide-up max-h-[85vh] overflow-y-auto scrollbar-hide pb-safe",
+      onClick: (ev) => ev.stopPropagation()
+    },
+      e('div', { className: "w-10 h-1 bg-zinc-700 rounded-full mx-auto mb-5" }),
+      e('h2', { className: "text-white font-display font-bold text-xl mb-1" }, title),
+      subtitle && e('p', { className: "text-zinc-500 text-xs font-mono-d mb-4 uppercase" }, subtitle),
+      children
+    )
+  );
+
+const WaterButton = ({ ml, onClick, emoji, label }) => 
+  e('button', { 
+    onClick,
+    className: "bg-gradient-to-br from-cyan-500/20 to-blue-500/10 border border-cyan-500/30 rounded-2xl p-5 active:scale-95 transition flex flex-col items-center gap-2"
+  },
+    e('div', { className: "text-4xl" }, emoji),
+    e('p', { className: "text-white font-display font-bold" }, label),
+    e('p', { className: "text-cyan-300 text-xs font-mono-d" }, `${ml} ml`)
+  );
+
+const StepsModal = ({ data, onClose, onSave }) => {
+  const [val, setVal] = uS(String(data.steps));
+  return e(Modal, { onClose, title: "Update steps" },
+    e('p', { className: "text-zinc-500 text-sm mb-5" }, 
+      "Manually log your total steps for today."
+    ),
+    e('div', { className: "bg-zinc-800 rounded-2xl p-4 mb-4" },
+      e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-1" }, "Currently logged"),
+      e('p', { className: "text-white text-3xl font-display font-bold" }, data.steps.toLocaleString()),
+      e('p', { className: "text-zinc-500 text-xs font-mono-d" }, `of ${data.stepsGoal.toLocaleString()} goal`)
+    ),
+    e('input', { 
+      value: val,
+      onChange: (ev) => setVal(ev.target.value),
+      type: "number",
+      placeholder: "e.g. 9500",
+      className: "w-full bg-zinc-800 text-white text-2xl font-display font-bold rounded-xl px-4 py-4 mb-4 placeholder-zinc-600 outline-none focus:ring-2 focus:ring-emerald-400 text-center"
+    }),
+    e('div', { className: "flex gap-3" },
+      e('button', { 
+        onClick: onClose,
+        className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+      }, "Cancel"),
+      e('button', { 
+        onClick: () => onSave(parseInt(val) || 0),
+        className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
+      },
+        e(Icon, { d: icons.check, size: 18, stroke: "black" }),
+        "Save"
+      )
+    )
+  );
+};
+
+const GoalModal = ({ data, onClose, onSave }) => {
+  const [val, setVal] = uS(String(data.caloriesGoal));
+  return e(Modal, { onClose, title: "Daily calorie goal" },
+    e('p', { className: "text-zinc-500 text-sm mb-5" }, 
+      "Workouts add calories on top of this goal."
+    ),
+    e('div', { className: "grid grid-cols-3 gap-2 mb-4" },
+      [1800, 2000, 2200, 2400, 2600, 2800].map(g => 
+        e('button', { 
+          key: g,
+          onClick: () => setVal(String(g)),
+          className: `rounded-xl py-3 font-display font-semibold ${parseInt(val) === g ? 'bg-emerald-400 text-black' : 'bg-zinc-800 text-white'}`
+        }, g)
+      )
+    ),
+    e('input', { 
+      value: val,
+      onChange: (ev) => setVal(ev.target.value),
+      type: "number",
+      placeholder: "2400",
+      className: "w-full bg-zinc-800 text-white text-2xl font-display font-bold rounded-xl px-4 py-4 mb-4 placeholder-zinc-600 outline-none focus:ring-2 focus:ring-emerald-400 text-center"
+    }),
+    e('div', { className: "flex gap-3" },
+      e('button', { 
+        onClick: onClose,
+        className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+      }, "Cancel"),
+      e('button', { 
+        onClick: () => onSave(parseInt(val) || 2400),
+        className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
+      },
+        e(Icon, { d: icons.check, size: 18, stroke: "black" }),
+        "Save"
+      )
+    )
+  );
+};
+
+const WeightModal = ({ data, onClose, onSave }) => {
+  const [val, setVal] = uS("");
+  return e(Modal, { onClose, title: "Log weight" },
+    e('p', { className: "text-zinc-500 text-sm mb-5" }, 
+      "Track weekly to see real progress without daily fluctuations."
+    ),
+    e('div', { className: "grid grid-cols-2 gap-3 mb-4" },
+      e('div', { className: "bg-zinc-800 rounded-2xl p-4" },
+        e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-1" }, "Current"),
+        e('p', { className: "text-white text-xl font-display font-bold" }, 
+          data.bodyWeight,
+          e('span', { className: "text-sm text-zinc-500" }, " kg")
+        )
+      ),
+      e('div', { className: "bg-purple-500/10 border border-purple-500/20 rounded-2xl p-4" },
+        e('p', { className: "text-[10px] text-purple-400 font-mono-d uppercase mb-1" }, "Target"),
+        e('p', { className: "text-white text-xl font-display font-bold" }, 
+          data.targetWeight,
+          e('span', { className: "text-sm text-zinc-500" }, " kg")
+        )
+      )
+    ),
+    e('input', { 
+      value: val,
+      onChange: (ev) => setVal(ev.target.value),
+      type: "number",
+      step: "0.1",
+      placeholder: "74.5",
+      className: "w-full bg-zinc-800 text-white text-2xl font-display font-bold rounded-xl px-4 py-4 mb-4 placeholder-zinc-600 outline-none focus:ring-2 focus:ring-purple-400 text-center"
+    }),
+    e('div', { className: "flex gap-3" },
+      e('button', { 
+        onClick: onClose,
+        className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+      }, "Cancel"),
+      e('button', { 
+        onClick: () => {
+          const w = parseFloat(val);
+          if (w > 0) onSave(w);
+        },
+        className: "flex-1 bg-purple-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
+      },
+        e(Icon, { d: icons.check, size: 18, stroke: "black" }),
+        "Save"
+      )
+    )
+  );
+};
+
+const AddMealModal = ({ onClose, onSave }) => {
+  const [name, setName] = uS("");
+  const [kcal, setKcal] = uS("");
+  const [emoji, setEmoji] = uS("🍽️");
+  const [saveAsTemplate, setSaveAsTemplate] = uS(false);
+  
+  return e(Modal, { onClose, title: "Log a meal" },
+    e('div', { className: "flex gap-2 mb-4 overflow-x-auto scrollbar-hide" },
+      ['🥣','🥗','🍕','🍔','🍱','🍝','🥤','🍎','🥑','🍌','🍣','🌮'].map(em => 
+        e('button', { 
+          key: em,
+          onClick: () => setEmoji(em),
+          className: `flex-shrink-0 w-12 h-12 rounded-xl text-2xl flex items-center justify-center ${emoji === em ? 'bg-emerald-500/30 border-2 border-emerald-400' : 'bg-zinc-800'}`
+        }, em)
+      )
+    ),
+    e('input', { 
+      value: name,
+      onChange: (ev) => setName(ev.target.value),
+      placeholder: "What did you eat?",
+      className: "w-full bg-zinc-800 text-white rounded-xl px-4 py-3 mb-3 placeholder-zinc-500 outline-none focus:ring-2 focus:ring-emerald-400"
+    }),
+    e('input', { 
+      value: kcal,
+      onChange: (ev) => setKcal(ev.target.value),
+      type: "number",
+      placeholder: "Calories (kcal)",
+      className: "w-full bg-zinc-800 text-white rounded-xl px-4 py-3 mb-4 placeholder-zinc-500 outline-none focus:ring-2 focus:ring-emerald-400"
+    }),
+    e('button', { 
+      onClick: () => setSaveAsTemplate(!saveAsTemplate),
+      className: "w-full bg-zinc-800 rounded-xl px-4 py-3 mb-4 flex items-center gap-3 active:scale-[0.98]"
+    },
+      e('div', { className: `w-5 h-5 rounded-md flex items-center justify-center ${saveAsTemplate ? 'bg-emerald-400' : 'bg-zinc-700 border border-zinc-600'}` },
+        saveAsTemplate && e(Icon, { d: icons.check, size: 14, stroke: "black" })
+      ),
+      e('span', { className: "text-white text-sm font-display flex-1 text-left" }, "Save as favorite for next time"),
+      e(Icon, { d: icons.star, size: 16, className: saveAsTemplate ? 'text-yellow-400' : 'text-zinc-600', fill: saveAsTemplate ? 'currentColor' : 'none' })
+    ),
+    e('div', { className: "flex gap-3" },
+      e('button', { 
+        onClick: onClose,
+        className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+      }, "Cancel"),
+      e('button', { 
+        onClick: () => {
+          if (name && kcal) onSave({ name, kcal: parseInt(kcal), emoji }, saveAsTemplate);
+        },
+        className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
+      },
+        e(Icon, { d: icons.check, size: 18, stroke: "black" }),
+        "Add"
+      )
+    )
+  );
+};
+
+const EditMealModal = ({ meal, onClose, onSave, onDelete }) => {
+  const [name, setName] = uS(meal.name);
+  const [kcal, setKcal] = uS(String(meal.kcal));
+  
+  return e(Modal, { onClose, title: "Edit meal" },
+    e('input', { 
+      value: name,
+      onChange: (ev) => setName(ev.target.value),
+      className: "w-full bg-zinc-800 text-white rounded-xl px-4 py-3 mb-3 outline-none focus:ring-2 focus:ring-emerald-400"
+    }),
+    e('input', { 
+      value: kcal,
+      onChange: (ev) => setKcal(ev.target.value),
+      type: "number",
+      className: "w-full bg-zinc-800 text-white rounded-xl px-4 py-3 mb-4 outline-none focus:ring-2 focus:ring-emerald-400"
+    }),
+    e('div', { className: "flex gap-3" },
+      e('button', { 
+        onClick: onDelete,
+        className: "bg-rose-500/20 text-rose-300 rounded-xl py-3 px-4 font-display font-semibold flex items-center gap-2"
+      },
+        e(Icon, { d: icons.trash, size: 16 })
+      ),
+      e('button', { 
+        onClick: onClose,
+        className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+      }, "Cancel"),
+      e('button', { 
+        onClick: () => onSave({ ...meal, name, kcal: parseInt(kcal) || 0 }),
+        className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold"
+      }, "Save")
+    )
+  );
+};
+
+const EditWorkoutModal = ({ workout, onClose, onSave, onDelete }) => {
+  const [w, setW] = uS(JSON.parse(JSON.stringify(workout)));
+  
+  const updateSet = (exIdx, setIdx, field, value) => {
+    const updated = { ...w };
+    updated.exercises[exIdx].sets[setIdx][field] = value === "" ? "" : parseFloat(value);
+    setW(updated);
+  };
+  
+  const removeSet = (exIdx, setIdx) => {
+    const updated = { ...w };
+    updated.exercises[exIdx].sets.splice(setIdx, 1);
+    setW(updated);
+  };
+  
+  const removeExercise = (exIdx) => {
+    const updated = { ...w };
+    updated.exercises.splice(exIdx, 1);
+    setW(updated);
+  };
+  
+  // Recompute total volume
+  const recalcVolume = (workout) => {
+    let total = 0;
+    for (const ex of workout.exercises) {
+      for (const s of ex.sets) {
+        if (s.weight && s.reps) total += s.weight * s.reps;
+      }
+    }
+    return Math.round(total);
+  };
+  
+  return e(Modal, { onClose, title: "Edit workout", subtitle: "Tap any value to change it" },
+    // Workout meta
+    e('div', { className: "grid grid-cols-2 gap-2 mb-4" },
+      e('div', { className: "bg-zinc-800 rounded-xl p-3" },
+        e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase mb-1" }, "Name"),
+        e('input', {
+          value: w.name,
+          onChange: (ev) => setW({ ...w, name: ev.target.value }),
+          className: "w-full bg-transparent text-white font-display font-semibold outline-none"
+        })
+      ),
+      e('div', { className: "bg-zinc-800 rounded-xl p-3" },
+        e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase mb-1" }, "Duration (min)"),
+        e('input', {
+          value: w.duration,
+          type: "number",
+          onChange: (ev) => setW({ ...w, duration: parseInt(ev.target.value) || 0 }),
+          className: "w-full bg-transparent text-white font-display font-semibold outline-none"
+        })
+      )
+    ),
+    e('div', { className: "bg-orange-500/10 border border-orange-500/20 rounded-xl p-3 mb-4" },
+      e('p', { className: "text-[9px] text-orange-400 font-mono-d uppercase mb-1" }, "Calories burned"),
+      e('input', {
+        value: w.kcal,
+        type: "number",
+        onChange: (ev) => setW({ ...w, kcal: parseInt(ev.target.value) || 0 }),
+        className: "w-full bg-transparent text-white font-display font-bold text-xl outline-none"
+      })
+    ),
+    
+    // Exercises
+    e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase mb-2" }, "Exercises"),
+    e('div', { className: "space-y-3 mb-4 max-h-96 overflow-y-auto scrollbar-hide" },
+      w.exercises.map((ex, exIdx) => e('div', { key: exIdx, className: "bg-zinc-800 rounded-xl p-3" },
+        e('div', { className: "flex justify-between items-start mb-2" },
+          e('p', { className: "text-white font-display font-semibold text-sm flex-1" }, ex.name),
+          e('button', { 
+            onClick: () => removeExercise(exIdx),
+            className: "text-rose-400 p-1"
+          }, e(Icon, { d: icons.trash, size: 14 }))
+        ),
+        e('div', { className: "space-y-1.5" },
+          ex.sets.map((s, setIdx) => e('div', { 
+            key: setIdx, 
+            className: "flex items-center gap-2 bg-zinc-900 rounded-lg p-2"
+          },
+            e('span', { className: "text-zinc-500 text-xs font-mono-d w-4" }, s.set || setIdx + 1),
+            // StairMaster set
+            ex.type === "stairmaster" || s.level !== undefined && s.duration !== undefined ?
+              e(React.Fragment, null,
+                e('div', { className: "flex-1 flex items-center gap-1" },
+                  e('span', { className: "text-zinc-500 text-[10px] font-mono-d" }, "LVL"),
+                  e('input', {
+                    type: "number", step: "0.5",
+                    value: s.level || "",
+                    onChange: (ev) => updateSet(exIdx, setIdx, 'level', ev.target.value),
+                    className: "w-12 bg-zinc-800 text-white font-mono-d text-sm rounded px-2 py-1 outline-none focus:ring-1 focus:ring-orange-400"
+                  })
+                ),
+                e('div', { className: "flex-1 flex items-center gap-1" },
+                  e('span', { className: "text-zinc-500 text-[10px] font-mono-d" }, "MIN"),
+                  e('input', {
+                    type: "number",
+                    value: s.duration || "",
+                    onChange: (ev) => updateSet(exIdx, setIdx, 'duration', ev.target.value),
+                    className: "w-12 bg-zinc-800 text-white font-mono-d text-sm rounded px-2 py-1 outline-none focus:ring-1 focus:ring-orange-400"
+                  })
+                )
+              ) :
+            // Treadmill set
+            ex.type === "treadmill" && s.incline !== undefined ?
+              e(React.Fragment, null,
+                e('div', { className: "flex-1 flex items-center gap-1" },
+                  e('span', { className: "text-zinc-500 text-[10px] font-mono-d" }, "INC"),
+                  e('input', {
+                    type: "number", step: "0.5",
+                    value: s.incline || "",
+                    onChange: (ev) => updateSet(exIdx, setIdx, 'incline', ev.target.value),
+                    className: "w-12 bg-zinc-800 text-white font-mono-d text-sm rounded px-2 py-1 outline-none focus:ring-1 focus:ring-orange-400"
+                  })
+                ),
+                e('div', { className: "flex-1 flex items-center gap-1" },
+                  e('span', { className: "text-zinc-500 text-[10px] font-mono-d" }, "MIN"),
+                  e('input', {
+                    type: "number",
+                    value: s.duration || "",
+                    onChange: (ev) => updateSet(exIdx, setIdx, 'duration', ev.target.value),
+                    className: "w-12 bg-zinc-800 text-white font-mono-d text-sm rounded px-2 py-1 outline-none focus:ring-1 focus:ring-orange-400"
+                  })
+                )
+              ) :
+            // Strength set
+              e(React.Fragment, null,
+                e('div', { className: "flex-1 flex items-center gap-1" },
+                  e('input', {
+                    type: "number", step: "0.5",
+                    value: s.weight || "",
+                    onChange: (ev) => updateSet(exIdx, setIdx, 'weight', ev.target.value),
+                    className: "w-16 bg-zinc-800 text-white font-mono-d text-sm rounded px-2 py-1 outline-none focus:ring-1 focus:ring-emerald-400"
+                  }),
+                  e('span', { className: "text-zinc-500 text-xs font-mono-d" }, "kg")
+                ),
+                e('span', { className: "text-zinc-600 text-xs" }, "×"),
+                e('div', { className: "flex-1 flex items-center gap-1" },
+                  e('input', {
+                    type: "number",
+                    value: s.reps || "",
+                    onChange: (ev) => updateSet(exIdx, setIdx, 'reps', ev.target.value),
+                    className: "w-12 bg-zinc-800 text-white font-mono-d text-sm rounded px-2 py-1 outline-none focus:ring-1 focus:ring-emerald-400"
+                  }),
+                  e('span', { className: "text-zinc-500 text-xs font-mono-d" }, "reps")
+                )
+              ),
+            e('button', { 
+              onClick: () => removeSet(exIdx, setIdx),
+              className: "text-zinc-500 p-1 active:text-rose-400"
+            }, e(Icon, { d: icons.x, size: 12 }))
+          ))
+        )
+      ))
+    ),
+    
+    e('div', { className: "flex gap-3" },
+      e('button', { 
+        onClick: () => { 
+          if (confirm("Delete this entire workout?")) onDelete(); 
+        },
+        className: "bg-rose-500/20 text-rose-300 rounded-xl py-3 px-4 font-display font-semibold flex items-center gap-2"
+      }, e(Icon, { d: icons.trash, size: 16 })),
+      e('button', { 
+        onClick: onClose,
+        className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+      }, "Cancel"),
+      e('button', { 
+        onClick: () => {
+          const updated = { ...w, totalVolume: recalcVolume(w) };
+          onSave(updated);
+        },
+        className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold"
+      }, "Save")
+    )
+  );
+};
+
+const ImportResultModal = ({ result, onConfirm, onCancel, bodyWeight }) => 
+  e('div', { className: "fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-end" },
+    e('div', { className: "w-full bg-zinc-900 rounded-t-3xl p-6 border-t border-white/10 max-h-[85vh] overflow-y-auto scrollbar-hide slide-up pb-safe" },
+      e('div', { className: "w-10 h-1 bg-zinc-700 rounded-full mx-auto mb-5" }),
+      e('div', { className: "flex items-center gap-2 mb-1" },
+        e('div', { className: "w-8 h-8 rounded-full bg-emerald-500/20 flex items-center justify-center" },
+          e(Icon, { d: icons.check, size: 16, className: "text-emerald-400" })
+        ),
+        e('h2', { className: "text-white font-display font-bold text-xl" }, "Workout extracted")
+      ),
+      e('p', { className: "text-zinc-500 text-xs font-mono-d mb-5 uppercase" }, 
+        `${result.exercises.length} exercises · ${result.exercises.reduce((s, ex) => s + ex.sets.length, 0)} sets`
+      ),
+      
+      e('div', { className: "bg-zinc-800 rounded-2xl p-4 mb-3" },
+        e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-1" }, "Workout name"),
+        e('p', { className: "text-white font-display font-bold text-lg" }, result.name)
+      ),
+      
+      e('div', { className: "grid grid-cols-3 gap-2 mb-3" },
+        e('div', { className: "bg-zinc-800 rounded-2xl p-3" },
+          e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-1" }, "Duration"),
+          e('p', { className: "text-white font-display font-bold" }, 
+            result.duration,
+            e('span', { className: "text-xs text-zinc-500" }, "min")
+          )
+        ),
+        e('div', { className: "bg-zinc-800 rounded-2xl p-3" },
+          e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-1" }, "Volume"),
+          e('p', { className: "text-white font-display font-bold" }, 
+            (result.totalVolume / 1000).toFixed(1),
+            e('span', { className: "text-xs text-zinc-500" }, "t")
+          )
+        ),
+        e('div', { className: "bg-gradient-to-br from-orange-500/20 to-rose-500/10 rounded-2xl p-3 border border-orange-500/20" },
+          e('p', { className: "text-[10px] text-orange-400 font-mono-d uppercase mb-1" }, "Est. kcal"),
+          e('p', { className: "text-white font-display font-bold" }, result.estimatedKcal)
+        )
+      ),
+      
+      e('div', { className: "bg-zinc-800 rounded-2xl p-4 mb-5 max-h-64 overflow-y-auto scrollbar-hide" },
+        e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-3" }, "Exercises"),
+        e('div', { className: "space-y-3" },
+          result.exercises.map((ex, i) => e('div', { key: i, className: "border-b border-white/5 last:border-0 pb-2 last:pb-0" },
+            e('p', { className: "text-white font-display font-semibold text-sm mb-1" }, 
+              ex.name,
+              ex.type === "stairmaster" && e('span', { className: "ml-2 text-[9px] bg-orange-500/30 text-orange-300 px-1.5 py-0.5 rounded font-mono-d uppercase" }, "Stair")
+            ),
+            e('div', { className: "space-y-0.5" },
+              ex.sets.map((s, j) => e('p', { key: j, className: "text-zinc-400 text-xs font-mono-d" },
+                `${s.set || j+1}. `,
+                s.display ? s.display :
+                  s.weight !== undefined ? `${s.weight}kg × ${s.reps}` : 
+                  s.level !== undefined ? `Level ${s.level} · ${s.duration}min` :
+                  s.incline !== undefined ? `Incline ${s.incline} · ${s.duration}min` : ""
+              ))
+            )
+          ))
+        )
+      ),
+      
+      e('p', { className: "text-[10px] text-zinc-600 font-mono-d mb-4 leading-relaxed" }, 
+        `* Calorie estimate: 5.5 MET × ${bodyWeight}kg × ${(result.duration/60).toFixed(2)}h. You can edit it after adding.`
+      ),
+      
+      e('div', { className: "flex gap-3" },
+        e('button', { 
+          onClick: onCancel,
+          className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+        }, "Cancel"),
+        e('button', { 
+          onClick: onConfirm,
+          className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
+        },
+          e(Icon, { d: icons.check, size: 18, stroke: "black" }),
+          "Add to today"
+        )
+      )
+    )
+  );
+
+// ============ WEIGHT CHART ============
+const renderWeightChart = (data, weightToGoal, weightLost) => {
+  const points = data.weightHistory.map(w => w.weight);
+  const minW = Math.min(...points, data.targetWeight) - 0.5;
+  const maxW = Math.max(...points) + 0.5;
+  const range = maxW - minW;
+  
+  return e('div', null,
+    e('div', { className: "relative h-44 mt-4 mb-2" },
+      e('div', { 
+        className: "absolute inset-x-0 border-t border-dashed border-emerald-400/40",
+        style: { top: `${((maxW - data.targetWeight) / range) * 100}%` }
+      },
+        e('span', { className: "absolute -top-2 right-0 text-[9px] font-mono-d bg-emerald-400/20 text-emerald-300 px-1.5 py-0.5 rounded" }, 
+          `GOAL ${data.targetWeight}kg`
+        )
+      ),
+      e('svg', { className: "w-full h-full", viewBox: "0 0 280 160", preserveAspectRatio: "none" },
+        e('defs', null,
+          e('linearGradient', { id: "weightGrad", x1: "0%", y1: "0%", x2: "0%", y2: "100%" },
+            e('stop', { offset: "0%", stopColor: "rgb(168, 85, 247)", stopOpacity: "0.4" }),
+            e('stop', { offset: "100%", stopColor: "rgb(168, 85, 247)", stopOpacity: "0" })
+          )
+        ),
+        e('path', {
+          d: `M 0,${((maxW - points[0]) / range) * 160} ${points.map((v, i) => `L ${(i/(points.length-1))*280},${((maxW - v) / range) * 160}`).join(' ')} L 280,160 L 0,160 Z`,
+          fill: "url(#weightGrad)"
+        }),
+        e('path', {
+          d: `M 0,${((maxW - points[0]) / range) * 160} ${points.map((v, i) => `L ${(i/(points.length-1))*280},${((maxW - v) / range) * 160}`).join(' ')}`,
+          stroke: "rgb(192, 132, 252)", strokeWidth: "2.5", fill: "none", strokeLinecap: "round"
+        }),
+        points.map((v, i) => e('circle', {
+          key: i,
+          cx: (i/(points.length-1))*280,
+          cy: ((maxW - v) / range) * 160,
+          r: i === points.length - 1 ? "4" : "3",
+          fill: i === points.length - 1 ? "rgb(192, 132, 252)" : "rgb(168, 85, 247)",
+          stroke: "black",
+          strokeWidth: "2"
+        }))
+      )
+    ),
+    e('div', { className: "grid grid-cols-3 gap-2 mt-5 pt-4 border-t border-white/5" },
+      e('div', null,
+        e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Current"),
+        e('p', { className: "text-white font-display font-bold" }, `${data.bodyWeight}kg`)
+      ),
+      e('div', null,
+        e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Lost"),
+        e('p', { className: "text-emerald-400 font-display font-bold" }, `-${weightLost}kg`)
+      ),
+      e('div', null,
+        e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "To goal"),
+        e('p', { className: "text-purple-400 font-display font-bold" }, `-${weightToGoal}kg`)
+      )
+    )
+  );
+};
+
+// ============ RENDER ============
+createRoot(document.getElementById('root')).render(e(App));
+</script>
+
+</body>
+</html>
