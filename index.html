@@ -54,58 +54,64 @@ const { useState: uS, useEffect: uE, useRef: uR } = React;
 // ============== FOOD DATABASE (kcal per 100g unless noted) ==============
 // Common foods with rough kcal estimates. Used to auto-calculate meals from ingredients.
 const FOOD_DB = {
-  // Grains & starches
-  "rice": { kcal: 130, unit: "g" },
-  "white rice": { kcal: 130, unit: "g" },
-  "brown rice": { kcal: 112, unit: "g" },
-  "pasta": { kcal: 158, unit: "g" },
-  "spaghetti": { kcal: 158, unit: "g" },
-  "bread": { kcal: 265, unit: "g" },
-  "white bread": { kcal: 265, unit: "g" },
-  "whole grain bread": { kcal: 247, unit: "g" },
-  "potato": { kcal: 77, unit: "g" },
-  "sweet potato": { kcal: 86, unit: "g" },
-  "oats": { kcal: 389, unit: "g" },
-  "oatmeal": { kcal: 68, unit: "g" },
-  "quinoa": { kcal: 120, unit: "g" },
-  "couscous": { kcal: 112, unit: "g" },
-  "tortilla": { kcal: 218, unit: "g" },
-  "noodles": { kcal: 138, unit: "g" },
+  // Grains & starches (g protein per 100g)
+  "rice": { kcal: 130, unit: "g", protein: 2.7 },
+  "white rice": { kcal: 130, unit: "g", protein: 2.7 },
+  "brown rice": { kcal: 112, unit: "g", protein: 2.6 },
+  "rice (dry)": { kcal: 365, unit: "g", protein: 7.1 },
+  "pasta": { kcal: 158, unit: "g", protein: 5.8 },
+  "spaghetti": { kcal: 158, unit: "g", protein: 5.8 },
+  "bread": { kcal: 265, unit: "g", protein: 9 },
+  "white bread": { kcal: 265, unit: "g", protein: 9 },
+  "whole grain bread": { kcal: 247, unit: "g", protein: 13 },
+  "potato": { kcal: 77, unit: "g", protein: 2 },
+  "sweet potato": { kcal: 86, unit: "g", protein: 1.6 },
+  "oats": { kcal: 389, unit: "g", protein: 17 },
+  "oatmeal": { kcal: 68, unit: "g", protein: 2.4 },
+  "quinoa": { kcal: 120, unit: "g", protein: 4.4 },
+  "couscous": { kcal: 112, unit: "g", protein: 3.8 },
+  "tortilla": { kcal: 218, unit: "g", protein: 5.7 },
+  "noodles": { kcal: 138, unit: "g", protein: 4.5 },
   // Proteins
-  "chicken": { kcal: 165, unit: "g" },
-  "chicken breast": { kcal: 165, unit: "g" },
-  "chicken thigh": { kcal: 209, unit: "g" },
-  "beef": { kcal: 250, unit: "g" },
-  "ground beef": { kcal: 254, unit: "g" },
-  "steak": { kcal: 271, unit: "g" },
-  "pork": { kcal: 242, unit: "g" },
-  "bacon": { kcal: 541, unit: "g" },
-  "salmon": { kcal: 208, unit: "g" },
-  "tuna": { kcal: 132, unit: "g" },
-  "cod": { kcal: 82, unit: "g" },
-  "shrimp": { kcal: 99, unit: "g" },
-  "egg": { kcal: 78, unit: "piece" },
-  "eggs": { kcal: 78, unit: "piece" },
-  "tofu": { kcal: 76, unit: "g" },
-  "tempeh": { kcal: 192, unit: "g" },
-  "lentils": { kcal: 116, unit: "g" },
-  "chickpeas": { kcal: 164, unit: "g" },
-  "black beans": { kcal: 132, unit: "g" },
+  "chicken": { kcal: 165, unit: "g", protein: 31 },
+  "chicken breast": { kcal: 165, unit: "g", protein: 31 },
+  "chicken thigh": { kcal: 209, unit: "g", protein: 26 },
+  "beef": { kcal: 250, unit: "g", protein: 26 },
+  "ground beef": { kcal: 254, unit: "g", protein: 26 },
+  "steak": { kcal: 271, unit: "g", protein: 25 },
+  "pork": { kcal: 242, unit: "g", protein: 27 },
+  "bacon": { kcal: 541, unit: "g", protein: 37 },
+  "salmon": { kcal: 208, unit: "g", protein: 20 },
+  "tuna": { kcal: 132, unit: "g", protein: 28 },
+  "cod": { kcal: 82, unit: "g", protein: 18 },
+  "shrimp": { kcal: 99, unit: "g", protein: 24 },
+  "egg": { kcal: 78, unit: "piece", protein: 6 },
+  "eggs": { kcal: 78, unit: "piece", protein: 6 },
+  "tofu": { kcal: 76, unit: "g", protein: 8 },
+  "tempeh": { kcal: 192, unit: "g", protein: 19 },
+  "lentils": { kcal: 116, unit: "g", protein: 9 },
+  "chickpeas": { kcal: 164, unit: "g", protein: 8.9 },
+  "black beans": { kcal: 132, unit: "g", protein: 8.9 },
+  "whey": { kcal: 380, unit: "g", protein: 76 },
+  "esn whey": { kcal: 383, unit: "g", protein: 76 },
+  "protein powder": { kcal: 380, unit: "g", protein: 76 },
   // Dairy
-  "milk": { kcal: 42, unit: "ml" },
-  "whole milk": { kcal: 61, unit: "ml" },
-  "skim milk": { kcal: 34, unit: "ml" },
-  "almond milk": { kcal: 17, unit: "ml" },
-  "oat milk": { kcal: 47, unit: "ml" },
-  "yogurt": { kcal: 59, unit: "g" },
-  "greek yogurt": { kcal: 97, unit: "g" },
-  "cheese": { kcal: 402, unit: "g" },
-  "cheddar": { kcal: 402, unit: "g" },
-  "mozzarella": { kcal: 280, unit: "g" },
-  "feta": { kcal: 264, unit: "g" },
-  "cottage cheese": { kcal: 98, unit: "g" },
-  "butter": { kcal: 717, unit: "g" },
-  "cream": { kcal: 340, unit: "ml" },
+  "milk": { kcal: 42, unit: "ml", protein: 3.4 },
+  "whole milk": { kcal: 61, unit: "ml", protein: 3.2 },
+  "skim milk": { kcal: 34, unit: "ml", protein: 3.4 },
+  "almond milk": { kcal: 17, unit: "ml", protein: 0.6 },
+  "oat milk": { kcal: 47, unit: "ml", protein: 1 },
+  "yogurt": { kcal: 59, unit: "g", protein: 3.5 },
+  "greek yogurt": { kcal: 97, unit: "g", protein: 9 },
+  "magerquark": { kcal: 70, unit: "g", protein: 12 },
+  "quark": { kcal: 70, unit: "g", protein: 12 },
+  "cheese": { kcal: 402, unit: "g", protein: 25 },
+  "cheddar": { kcal: 402, unit: "g", protein: 25 },
+  "mozzarella": { kcal: 280, unit: "g", protein: 22 },
+  "feta": { kcal: 264, unit: "g", protein: 14 },
+  "cottage cheese": { kcal: 98, unit: "g", protein: 11 },
+  "butter": { kcal: 717, unit: "g", protein: 0.9 },
+  "cream": { kcal: 340, unit: "ml", protein: 2 },
   // Vegetables
   "vegetables": { kcal: 35, unit: "g" },
   "veggies": { kcal: 35, unit: "g" },
@@ -209,10 +215,58 @@ const estimateIngredientKcal = (name, amount, unit) => {
   return Math.round((food.kcal * amtInBaseUnit) / 100);
 };
 
+// Estimate protein (g) for an ingredient
+const estimateIngredientProtein = (name, amount, unit) => {
+  if (!name || !amount) return 0;
+  const key = name.toLowerCase().trim();
+  let food = FOOD_DB[key];
+  if (!food) {
+    const matches = Object.keys(FOOD_DB).filter(k => 
+      key.includes(k) || k.includes(key)
+    ).sort((a, b) => b.length - a.length);
+    if (matches.length > 0) food = FOOD_DB[matches[0]];
+  }
+  if (!food || food.protein === undefined) return 0;
+  
+  const amt = parseFloat(amount);
+  if (isNaN(amt)) return 0;
+  
+  if (food.unit === "piece") {
+    return Math.round(food.protein * amt * 10) / 10;
+  }
+  
+  let amtInBaseUnit = amt;
+  if (unit === "kg") amtInBaseUnit = amt * 1000;
+  else if (unit === "l") amtInBaseUnit = amt * 1000;
+  else if (unit === "tbsp") amtInBaseUnit = amt * 15;
+  else if (unit === "tsp") amtInBaseUnit = amt * 5;
+  else if (unit === "cup") amtInBaseUnit = amt * 240;
+  else if (unit === "oz") amtInBaseUnit = amt * 28;
+  
+  return Math.round(((food.protein * amtInBaseUnit) / 100) * 10) / 10;
+};
+
 // ============== STORAGE LAYER ==============
 const STORAGE_KEY = "fitsync_v1";
-const SCHEMA_VERSION = 2; // Increment when changing data structure
+const SCHEMA_VERSION = 3; // Increment when changing data structure
 const BACKUP_REMINDER_DAYS = 5; // Remind user to backup after this many days
+
+// ============== TIMEZONE-SAFE DATE HELPERS ==============
+// All dates use LOCAL time. Never use toISOString() which is UTC.
+// Format used everywhere: "YYYY-MM-DD" (local) for storage; .toDateString() for display matching.
+const toLocalISO = (d) => {
+  // Returns "YYYY-MM-DD" using local time, NOT UTC.
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+const fromLocalISO = (iso) => {
+  // Parses "YYYY-MM-DD" as local time, NOT UTC.
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(y, m - 1, d);
+};
+const todayLocalISO = () => toLocalISO(new Date());
 
 const defaultData = {
   caloriesGoal: 2400,
@@ -257,8 +311,38 @@ const defaultData = {
     6: 'workout', // Saturday
   },
   savedMeals: [
-    { id: 1, name: "Greek yogurt + berries", kcal: 320, emoji: "🥣", tag: "breakfast", protein: 22, carbs: 38, fats: 8 },
-    { id: 2, name: "Pre-workout snack", kcal: 220, emoji: "🍌", tag: "snack", protein: 8, carbs: 42, fats: 3 },
+    { 
+      id: 1, name: "Lunch", kcal: 847, emoji: "🍱", tag: "lunch", 
+      protein: 81, carbs: 95, fats: 12,
+      ingredients: [
+        { name: "Rice (dry)", grams: 80, kcal: 292, protein: 6 },
+        { name: "Chicken breast", grams: 200, kcal: 330, protein: 62 },
+        { name: "Sriracha", grams: 80, kcal: 25, protein: 1 },
+        { name: "Mixed veggies", grams: 800, kcal: 200, protein: 12 },
+      ]
+    },
+    { 
+      id: 2, name: "Pre-workout snack", kcal: 350, emoji: "🥛", tag: "snack", 
+      protein: 60, carbs: 20, fats: 1,
+      ingredients: [
+        { name: "Magerquark", grams: 500, kcal: 350, protein: 60 },
+      ]
+    },
+    { 
+      id: 3, name: "Dinner", kcal: 391, emoji: "🥗", tag: "dinner", 
+      protein: 28, carbs: 22, fats: 18,
+      ingredients: [
+        { name: "Mixed veggies", grams: 700, kcal: 175, protein: 10 },
+        { name: "Eggs", grams: 3, kcal: 216, protein: 18 }, // grams used as count for eggs
+      ]
+    },
+    { 
+      id: 4, name: "Protein shake", kcal: 115, emoji: "💪", tag: "snack", 
+      protein: 22, carbs: 3, fats: 1,
+      ingredients: [
+        { name: "ESN whey", grams: 30, kcal: 115, protein: 22 },
+      ]
+    },
   ],
   lastDate: new Date().toDateString(),
   // Schema versioning for safe migrations on future updates
@@ -1216,6 +1300,46 @@ const migrations = {
     if (!data.coachingHistory) data.coachingHistory = [];
     return data;
   },
+  // From version 2 → 3: replace template savedMeals with real meal plans
+  // Only replaces if the user hasn't customized them (still has default Greek yogurt entry)
+  3: (data) => {
+    const hasOldDefaults = (data.savedMeals || []).some(m => 
+      m.name === "Greek yogurt + berries" || m.name === "Pre-workout snack" && m.kcal === 220
+    );
+    if (hasOldDefaults || !data.savedMeals || data.savedMeals.length === 0) {
+      data.savedMeals = [
+        { 
+          id: 1, name: "Lunch", kcal: 847, emoji: "🍱", tag: "lunch", 
+          protein: 81, carbs: 95, fats: 12,
+          ingredients: [
+            { name: "Rice (dry)", grams: 80, kcal: 292, protein: 6 },
+            { name: "Chicken breast", grams: 200, kcal: 330, protein: 62 },
+            { name: "Sriracha", grams: 80, kcal: 25, protein: 1 },
+            { name: "Mixed veggies", grams: 800, kcal: 200, protein: 12 },
+          ]
+        },
+        { 
+          id: 2, name: "Pre-workout snack", kcal: 350, emoji: "🥛", tag: "snack", 
+          protein: 60, carbs: 20, fats: 1,
+          ingredients: [{ name: "Magerquark", grams: 500, kcal: 350, protein: 60 }]
+        },
+        { 
+          id: 3, name: "Dinner", kcal: 391, emoji: "🥗", tag: "dinner", 
+          protein: 28, carbs: 22, fats: 18,
+          ingredients: [
+            { name: "Mixed veggies", grams: 700, kcal: 175, protein: 10 },
+            { name: "Eggs", grams: 3, kcal: 216, protein: 18 },
+          ]
+        },
+        { 
+          id: 4, name: "Protein shake", kcal: 115, emoji: "💪", tag: "snack", 
+          protein: 22, carbs: 3, fats: 1,
+          ingredients: [{ name: "ESN whey", grams: 30, kcal: 115, protein: 22 }]
+        },
+      ];
+    }
+    return data;
+  },
   // Future versions added here. Keep all migrations idempotent.
 };
 
@@ -1891,7 +2015,15 @@ const App = () => {
   };
 
   const totalEaten = data.meals.reduce((s, m) => s + m.kcal, 0);
+  const totalProtein = data.meals.reduce((s, m) => s + (m.protein || 0), 0);
+  const totalCarbs = data.meals.reduce((s, m) => s + (m.carbs || 0), 0);
+  const totalFats = data.meals.reduce((s, m) => s + (m.fats || 0), 0);
   const totalBurned = data.workouts.reduce((s, w) => s + (w.kcal || 0), 0);
+  // Protein goal: 1.8g/kg for cutting/maintaining, 2.0g/kg for bulking
+  const proteinGoalPerKg = data.goalType === "cut" ? 1.8 : data.goalType === "bulk" ? 2.0 : 1.6;
+  const proteinGoal = Math.round(data.bodyWeight * proteinGoalPerKg);
+  const proteinLeft = Math.max(0, proteinGoal - totalProtein);
+  const proteinProgress = Math.min(100, (totalProtein / proteinGoal) * 100);
   // Burned calories are shown as info but don't add to budget
   const caloriesLeft = data.caloriesGoal - totalEaten;
   const calProgress = (totalEaten / data.caloriesGoal) * 100;
@@ -1949,13 +2081,14 @@ const App = () => {
   };
 
   const confirmImport = (targetDate) => {
-    // targetDate is optional — if provided as a Date or ISO string, the workout is backdated
+    // targetDate is optional — if provided as a "YYYY-MM-DD" string, the workout is backdated
     const today = new Date().toDateString();
     let dateForWorkout = today;
     let isBackdated = false;
     
     if (targetDate) {
-      const d = (targetDate instanceof Date) ? targetDate : new Date(targetDate);
+      // targetDate is a "YYYY-MM-DD" local-date string. Parse as LOCAL time.
+      const d = fromLocalISO(targetDate);
       dateForWorkout = d.toDateString();
       if (dateForWorkout !== today) {
         isBackdated = true;
@@ -1980,7 +2113,7 @@ const App = () => {
       const datedWorkout = {
         ...newWorkout,
         date: dateForWorkout,
-        dateISO: new Date(dateForWorkout).toISOString(),
+        dateISO: fromLocalISO(targetDate).toISOString(),
         backdated: true,
       };
       updateData({ 
@@ -2235,6 +2368,48 @@ const App = () => {
                 style: { width: `${Math.min(calProgress, 100)}%` }
               })
             )
+          )
+        )
+      ),
+
+      // PROTEIN PANEL
+      e('div', { className: "rounded-2xl bg-zinc-900/80 border border-white/5 p-4 mb-4" },
+        e('div', { className: "flex justify-between items-center mb-2" },
+          e('div', { className: "flex items-center gap-2" },
+            e('span', { className: "text-base" }, "🥩"),
+            e('div', null,
+              e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase" }, "Protein"),
+              e('p', { className: "text-white font-display font-bold text-base" },
+                `${Math.round(totalProtein)} / ${proteinGoal}`,
+                e('span', { className: "text-zinc-500 text-xs font-mono-d ml-1" }, "g")
+              )
+            )
+          ),
+          e('div', { className: "text-right" },
+            e('p', { 
+              className: `text-sm font-display font-bold ${proteinProgress >= 80 ? 'text-emerald-400' : proteinProgress >= 50 ? 'text-yellow-400' : 'text-orange-400'}`
+            }, 
+              proteinLeft > 0 ? `${proteinLeft}g left` : "✓ hit"
+            ),
+            e('p', { className: "text-[9px] text-zinc-600 font-mono-d uppercase" }, 
+              `${proteinGoalPerKg}g/kg target`
+            )
+          )
+        ),
+        // Progress bar
+        e('div', { className: "h-2 bg-zinc-800 rounded-full overflow-hidden" },
+          e('div', { 
+            className: `h-full rounded-full transition-all duration-500 ${proteinProgress >= 80 ? 'bg-emerald-400' : proteinProgress >= 50 ? 'bg-yellow-400' : 'bg-orange-400'}`,
+            style: { width: `${proteinProgress}%` }
+          })
+        ),
+        // Macro breakdown (if any data)
+        (totalCarbs > 0 || totalFats > 0) && e('div', { className: "flex gap-3 mt-2.5 text-[10px] font-mono-d" },
+          e('span', { className: "text-cyan-400" }, `${Math.round(totalCarbs)}C`),
+          e('span', { className: "text-yellow-400" }, `${Math.round(totalFats)}F`),
+          e('span', { className: "text-emerald-400" }, `${Math.round(totalProtein)}P`),
+          e('span', { className: "text-zinc-600 ml-auto" }, 
+            `${Math.round(totalProtein * 4 + totalCarbs * 4 + totalFats * 9)} kcal from macros`
           )
         )
       ),
@@ -2968,7 +3143,44 @@ const App = () => {
               )
             )
           ))
-        )
+        ),
+      
+      // RECENT BACKDATED / HISTORY (last 14 days, excluding today)
+      (() => {
+        const today = new Date().toDateString();
+        const recent = (data.workoutHistory || [])
+          .filter(w => w.date !== today)
+          .sort((a, b) => new Date(b.dateISO || b.date) - new Date(a.dateISO || a.date))
+          .slice(0, 10);
+        if (recent.length === 0) return null;
+        return e('div', { className: "mt-6" },
+          e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase mb-3" }, 
+            `Recent · ${recent.length} workout${recent.length > 1 ? 's' : ''}`
+          ),
+          e('div', { className: "space-y-2" },
+            recent.map(w => e('button', { 
+              key: w.id,
+              onClick: () => setEditingWorkout(w),
+              className: "w-full bg-zinc-900/60 rounded-2xl p-3 border border-white/5 text-left active:scale-[0.98] flex items-center gap-3"
+            },
+              e('div', { className: "w-10 h-10 rounded-xl bg-zinc-800 flex items-center justify-center text-lg" }, w.icon || "🏋️"),
+              e('div', { className: "flex-1 min-w-0" },
+                e('div', { className: "flex items-center gap-2 flex-wrap" },
+                  e('p', { className: "text-white font-display font-semibold text-sm truncate" }, w.name),
+                  w.backdated && e('span', { className: "text-[8px] bg-purple-500/30 text-purple-300 px-1.5 py-0.5 rounded font-mono-d uppercase" }, "back"),
+                  w.energyLevel && e('span', { className: "text-[9px] text-zinc-400" }, 
+                    w.energyLevel <= 2 ? "😩" : w.energyLevel === 3 ? "😐" : w.energyLevel === 4 ? "😊" : "🔥"
+                  )
+                ),
+                e('p', { className: "text-zinc-500 text-[10px] font-mono-d" }, 
+                  `${new Date(w.dateISO || w.date).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · ${w.duration}min · ${w.kcal} kcal`
+                )
+              ),
+              e(Icon, { d: icons.chevron, size: 12, className: "text-zinc-600" })
+            ))
+          )
+        );
+      })()
     ),
 
     // ============ COACH TAB ============
@@ -3611,29 +3823,45 @@ const App = () => {
     }),
     
     // Saved meals modal
-    modal === 'savedMeals' && e(Modal, { onClose: () => setModal(null), title: "Quick add", subtitle: "Tap any to log instantly" },
+    modal === 'savedMeals' && e(Modal, { onClose: () => setModal(null), title: "Quick add", subtitle: "Tap to log · long-press to delete" },
       data.savedMeals.length === 0 ? 
         e('p', { className: "text-zinc-600 text-sm text-center py-8" }, "No saved meals yet. Add one with the + button.") :
         e('div', { className: "space-y-2 max-h-96 overflow-y-auto scrollbar-hide" },
-          data.savedMeals.map(m => e('button', { 
+          data.savedMeals.map(m => e('div', { 
             key: m.id,
-            onClick: () => {
-              const t = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-              updateData({ meals: [...data.meals, { ...m, id: Date.now(), time: t, saved: true }] });
-              setModal(null);
-            },
-            className: "w-full bg-zinc-800 rounded-2xl p-3.5 flex items-center gap-3 active:scale-[0.98]"
+            className: "w-full bg-zinc-800 rounded-2xl flex items-center gap-2 overflow-hidden"
           },
-            e('div', { className: "w-11 h-11 rounded-xl bg-zinc-700 flex items-center justify-center text-2xl" }, m.emoji),
-            e('div', { className: "flex-1 text-left" },
-              e('p', { className: "text-white text-sm font-display font-semibold" }, m.name),
-              e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase" }, 
-                `${m.tag} · ${m.protein}P · ${m.carbs}C · ${m.fats}F`
+            // Tap to log
+            e('button', {
+              onClick: () => {
+                const t = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+                updateData({ meals: [...data.meals, { ...m, id: Date.now(), time: t, saved: true }] });
+                setModal(null);
+              },
+              className: "flex-1 flex items-center gap-3 p-3.5 active:scale-[0.98] text-left"
+            },
+              e('div', { className: "w-11 h-11 rounded-xl bg-zinc-700 flex items-center justify-center text-2xl" }, m.emoji),
+              e('div', { className: "flex-1 min-w-0" },
+                e('p', { className: "text-white text-sm font-display font-semibold truncate" }, m.name),
+                e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase truncate" }, 
+                  `${m.tag} · ${m.protein || 0}P · ${m.carbs || 0}C · ${m.fats || 0}F`
+                )
+              ),
+              e('div', { className: "text-right flex-shrink-0" },
+                e('p', { className: "text-emerald-400 font-display font-bold" }, m.kcal),
+                e('p', { className: "text-zinc-600 text-[10px] font-mono-d" }, "kcal")
               )
             ),
-            e('div', { className: "text-right" },
-              e('p', { className: "text-emerald-400 font-display font-bold" }, m.kcal),
-              e('p', { className: "text-zinc-600 text-[10px] font-mono-d" }, "kcal")
+            // Delete button
+            e('button', {
+              onClick: () => {
+                if (confirm(`Remove "${m.name}" from favorites?`)) {
+                  updateData({ savedMeals: data.savedMeals.filter(sm => sm.id !== m.id) });
+                }
+              },
+              className: "flex-shrink-0 w-12 h-full flex items-center justify-center bg-rose-500/10 active:bg-rose-500/30 transition self-stretch"
+            },
+              e(Icon, { d: icons.trash, size: 14, className: "text-rose-400" })
             )
           ))
         )
@@ -3680,13 +3908,28 @@ const App = () => {
       trainingGoal: data.trainingGoal || "progressive_overload",
       onClose: () => setEditingWorkout(null),
       onSave: (updated) => {
-        updateData({ 
-          workouts: data.workouts.map(w => w.id === updated.id ? updated : w)
-        });
+        // Determine if this workout lives in workoutHistory (backdated) or today's workouts
+        const isInHistory = (data.workoutHistory || []).some(w => w.id === updated.id);
+        if (isInHistory) {
+          updateData({ 
+            workoutHistory: data.workoutHistory.map(w => w.id === updated.id ? { ...updated, date: w.date, dateISO: w.dateISO, backdated: w.backdated } : w)
+          });
+        } else {
+          updateData({ 
+            workouts: data.workouts.map(w => w.id === updated.id ? updated : w)
+          });
+        }
         setEditingWorkout(null);
       },
       onDelete: () => {
-        deleteWorkout(editingWorkout.id);
+        const isInHistory = (data.workoutHistory || []).some(w => w.id === editingWorkout.id);
+        if (isInHistory) {
+          updateData({ 
+            workoutHistory: data.workoutHistory.filter(w => w.id !== editingWorkout.id)
+          });
+        } else {
+          deleteWorkout(editingWorkout.id);
+        }
         setEditingWorkout(null);
       }
     }),
@@ -4910,9 +5153,14 @@ const AddMealModal = ({ onClose, onSave }) => {
         onClick: () => {
           if (name && finalKcal > 0) {
             const validIngredients = ingredients.filter(i => i.name && i.amount);
+            // Compute total protein from ingredients
+            const totalProtein = validIngredients.reduce((sum, ing) => 
+              sum + (estimateIngredientProtein(ing.name, ing.amount, ing.unit) || 0)
+            , 0);
             onSave({ 
               name, 
               kcal: finalKcal, 
+              protein: Math.round(totalProtein),
               emoji,
               ingredients: validIngredients
             }, saveAsTemplate);
@@ -5381,23 +5629,23 @@ const EditWorkoutModal = ({ workout, bodyWeight, workoutHistory, trainingGoal, o
 };
 
 const ImportResultModal = ({ result, onConfirm, onCancel, bodyWeight }) => {
-  // Default to today
-  const todayISO = new Date().toISOString().slice(0, 10);
+  // Use LOCAL date (not UTC) so dates match what user sees on calendar.
+  const todayISO = todayLocalISO();
   const [selectedDate, setSelectedDate] = uS(todayISO);
   const [showDatePicker, setShowDatePicker] = uS(false);
   
   const isToday = selectedDate === todayISO;
-  const dateLabel = isToday ? "Today" : new Date(selectedDate).toLocaleDateString('en-US', { 
+  const dateLabel = isToday ? "Today" : fromLocalISO(selectedDate).toLocaleDateString('en-US', { 
     weekday: 'short', month: 'short', day: 'numeric', year: 'numeric'
   });
   
-  // Generate quick-pick dates (today, yesterday, 2-7 days ago)
+  // Generate quick-pick dates (today, yesterday, 2-7 days ago) using LOCAL time
   const quickDates = [];
   for (let i = 0; i < 7; i++) {
     const d = new Date();
     d.setDate(d.getDate() - i);
     quickDates.push({
-      iso: d.toISOString().slice(0, 10),
+      iso: toLocalISO(d),
       label: i === 0 ? "Today" : i === 1 ? "Yesterday" : d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
       day: d.toLocaleDateString('en-US', { weekday: 'short' }),
     });
@@ -5509,7 +5757,7 @@ const ImportResultModal = ({ result, onConfirm, onCancel, bodyWeight }) => {
           className: `flex-1 rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2 ${isToday ? 'bg-emerald-400 text-black' : 'bg-purple-400 text-black'}`
         },
           e(Icon, { d: icons.check, size: 18, stroke: "black" }),
-          isToday ? "Add to today" : "Add to " + new Date(selectedDate).toLocaleDateString('en-US', { weekday: 'short' })
+          isToday ? "Add to today" : "Add to " + fromLocalISO(selectedDate).toLocaleDateString('en-US', { weekday: 'short' })
         )
       )
     )
