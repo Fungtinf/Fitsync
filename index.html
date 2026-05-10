@@ -248,7 +248,7 @@ const estimateIngredientProtein = (name, amount, unit) => {
 
 // ============== STORAGE LAYER ==============
 const STORAGE_KEY = "fitsync_v1";
-const SCHEMA_VERSION = 4; // Increment when changing data structure
+const SCHEMA_VERSION = 5; // Increment when changing data structure
 const BACKUP_REMINDER_DAYS = 5; // Remind user to backup after this many days
 
 // ============== TIMEZONE-SAFE DATE HELPERS ==============
@@ -268,10 +268,21 @@ const fromLocalISO = (iso) => {
 };
 const todayLocalISO = () => toLocalISO(new Date());
 
+// ============== STEPS HELPERS ==============
+// Computes "current total steps today" from a list of timestamped entries.
+// Uses the highest count (cumulative readings should always increase).
+const stepsFromEntries = (entries) => {
+  if (!entries || entries.length === 0) return 0;
+  return Math.max(...entries.map(e => e.count || 0));
+};
+
 const defaultData = {
   caloriesGoal: 2400,
   steps: 0,
   stepsGoal: 10000,
+  // Timestamped step entries for today: [{time: "HH:MM", count: 3500, dateISO: ISO string}]
+  // The latest count (highest, or last by time) is the total for the day.
+  stepEntries: [],
   water: 0,
   waterGoal: 8,
   bodyWeight: 75.0,
@@ -436,21 +447,43 @@ const generateSmartTips = (data, balance, tdee, isOnTrack, isTooAggressive, tota
     }
   }
   
-  // Step count tips
-  if (stepProgress < 0.4 && hour >= 14 && hour < 21) {
-    const needed = data.stepsGoal - data.steps;
-    const walkMin = Math.round(needed / 100); // ~100 steps/min
-    tips.push({
-      emoji: "👟",
-      title: `${needed.toLocaleString()} steps to your goal`,
-      detail: `A ${Math.min(45, walkMin)}-min walk this afternoon gets you there. Movement also boosts mood and energy.`
-    });
-  } else if (stepProgress < 0.7 && hour >= 19) {
-    tips.push({
-      emoji: "🌙",
-      title: "Quick evening walk?",
-      detail: `${(data.stepsGoal - data.steps).toLocaleString()} steps left for the day. Even 15 min helps.`
-    });
+  // Step count tips — use time-of-day expected pace
+  // Assume waking hours are 8am-10pm (14 hours). Linear pace: hour H → (H-8)/14 * goal.
+  if (hour >= 10 && hour < 22) {
+    const expectedProgress = Math.max(0, Math.min(1, (hour - 8) / 14));
+    const expectedSteps = Math.round(data.stepsGoal * expectedProgress);
+    const stepGap = expectedSteps - data.steps;
+    
+    if (stepGap > 1500) {
+      // Significantly behind pace
+      const remaining = data.stepsGoal - data.steps;
+      const walkMin = Math.round(stepGap / 100); // ~100 steps/min walking
+      tips.push({
+        emoji: "👟",
+        title: `It's ${hour}:00 and you're behind on steps`,
+        detail: `${data.steps.toLocaleString()} logged, ~${expectedSteps.toLocaleString()} expected by now. A ${Math.min(45, walkMin)}-min walk closes the gap.`
+      });
+    } else if (stepProgress < 0.4 && hour >= 14 && stepGap > 500) {
+      const needed = data.stepsGoal - data.steps;
+      const walkMin = Math.round(needed / 100);
+      tips.push({
+        emoji: "👟",
+        title: `${needed.toLocaleString()} steps to your goal`,
+        detail: `A ${Math.min(45, walkMin)}-min walk this afternoon gets you there. Movement also boosts mood and energy.`
+      });
+    } else if (stepProgress < 0.7 && hour >= 19) {
+      tips.push({
+        emoji: "🌙",
+        title: "Quick evening walk?",
+        detail: `${(data.stepsGoal - data.steps).toLocaleString()} steps left for the day. Even 15 min helps.`
+      });
+    } else if (stepProgress >= 1 && hour >= 17) {
+      tips.push({
+        emoji: "🎯",
+        title: "Step goal hit",
+        detail: `${data.steps.toLocaleString()} steps logged — well past your ${data.stepsGoal.toLocaleString()} goal.`
+      });
+    }
   }
   
   // Sleep tips (if user has logged it)
@@ -1601,6 +1634,21 @@ const migrations = {
     }
     return data;
   },
+  // From version 4 → 5: add timestamped step entries
+  5: (data) => {
+    if (!data.stepEntries) {
+      data.stepEntries = [];
+      // Convert existing single-number `steps` into a single entry timestamped now
+      if (data.steps && data.steps > 0) {
+        data.stepEntries = [{
+          time: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
+          count: data.steps,
+          dateISO: new Date().toISOString(),
+        }];
+      }
+    }
+    return data;
+  },
   // Future versions added here. Keep all migrations idempotent.
 };
 
@@ -1632,13 +1680,19 @@ const loadData = () => {
     
     // Daily reset for non-cumulative fields
     if (parsed.lastDate !== new Date().toDateString()) {
+      // Compute final step count from stepEntries (or fall back to legacy steps field)
+      const finalSteps = (parsed.stepEntries && parsed.stepEntries.length > 0)
+        ? Math.max(...parsed.stepEntries.map(e => e.count || 0))
+        : (parsed.steps || 0);
+      
       // Archive yesterday's snapshot for AI context
       const yesterdaySnapshot = {
         date: parsed.lastDate,
         meals: parsed.meals || [],
         workouts: parsed.workouts || [],
         water: parsed.water || 0,
-        steps: parsed.steps || 0,
+        steps: finalSteps,
+        stepEntries: parsed.stepEntries || [],
         sleepHours: parsed.sleepHours,
         totalEaten: (parsed.meals || []).reduce((s, m) => s + (m.kcal || 0), 0),
         totalBurned: (parsed.workouts || []).reduce((s, w) => s + (w.kcal || 0), 0),
@@ -1669,8 +1723,13 @@ const loadData = () => {
       parsed.workouts = [];
       parsed.water = 0;
       parsed.steps = 0;
+      parsed.stepEntries = []; // reset stepEntries each day
       parsed.sleepHours = null; // resets daily — must log fresh each morning
       parsed.lastDate = new Date().toDateString();
+    }
+    // Keep data.steps in sync with stepEntries (latest reading wins)
+    if (parsed.stepEntries && parsed.stepEntries.length > 0) {
+      parsed.steps = stepsFromEntries(parsed.stepEntries);
     }
     // Use deep merge for new fields, but preserve user data
     return { ...defaultData, ...parsed };
@@ -3506,11 +3565,16 @@ const App = () => {
           e('p', { className: "text-white text-2xl font-display font-bold" }, data.steps.toLocaleString()),
           e('p', { className: "text-zinc-500 text-xs font-mono-d" }, `/ ${data.stepsGoal.toLocaleString()} steps`),
           e('div', { className: "h-1 bg-zinc-800 rounded-full mt-2 overflow-hidden" },
-            e('div', { className: "h-full bg-emerald-400 rounded-full", style: { width: `${Math.min(stepProgress, 100)}%` } })
+            e('div', { 
+              className: `h-full rounded-full transition-all duration-500 ${stepProgress >= 100 ? 'bg-emerald-400' : stepProgress >= 70 ? 'bg-cyan-400' : stepProgress >= 30 ? 'bg-yellow-400' : 'bg-orange-400'}`,
+              style: { width: `${Math.min(stepProgress, 100)}%` } 
+            })
           ),
           e('p', { className: "text-[9px] text-zinc-600 font-mono-d mt-1.5 flex items-center gap-1" },
             e(Icon, { d: icons.edit, size: 8 }),
-            "tap to edit"
+            (data.stepEntries && data.stepEntries.length > 0)
+              ? `${data.stepEntries.length} reading${data.stepEntries.length > 1 ? 's' : ''} · tap to add`
+              : "tap to log"
           )
         ),
         // Water
@@ -4505,7 +4569,54 @@ const App = () => {
     modal === 'steps' && e(StepsModal, { 
       data, 
       onClose: () => setModal(null), 
-      onSave: (s, forDate) => { setMetricForDate('steps', s, forDate); setModal(null); }
+      onAddEntry: (entry, forDate) => {
+        if (!forDate) {
+          // Today: append to data.stepEntries, update data.steps to latest max
+          const newEntries = [...(data.stepEntries || []), entry];
+          updateData({ 
+            stepEntries: newEntries,
+            steps: stepsFromEntries(newEntries),
+          });
+        } else {
+          // Backdating: write into coachingHistory
+          const targetDateStr = fromLocalISO(forDate).toDateString();
+          const history = [...(data.coachingHistory || [])];
+          let dayEntry = history.find(d => d.date === targetDateStr);
+          if (!dayEntry) {
+            dayEntry = { 
+              date: targetDateStr, meals: [], workouts: [],
+              water: 0, steps: 0, stepEntries: [], sleepHours: null,
+              totalEaten: 0, totalBurned: 0,
+            };
+            history.push(dayEntry);
+          }
+          dayEntry.stepEntries = [...(dayEntry.stepEntries || []), entry];
+          dayEntry.steps = stepsFromEntries(dayEntry.stepEntries);
+          updateData({ coachingHistory: history.slice(-30) });
+        }
+      },
+      onDeleteEntry: (entry, forDate) => {
+        if (!forDate) {
+          const newEntries = (data.stepEntries || []).filter(e => 
+            !(e.time === entry.time && e.count === entry.count)
+          );
+          updateData({ 
+            stepEntries: newEntries,
+            steps: stepsFromEntries(newEntries),
+          });
+        } else {
+          const targetDateStr = fromLocalISO(forDate).toDateString();
+          const history = [...(data.coachingHistory || [])];
+          const dayEntry = history.find(d => d.date === targetDateStr);
+          if (dayEntry) {
+            dayEntry.stepEntries = (dayEntry.stepEntries || []).filter(e => 
+              !(e.time === entry.time && e.count === entry.count)
+            );
+            dayEntry.steps = stepsFromEntries(dayEntry.stepEntries);
+          }
+          updateData({ coachingHistory: history });
+        }
+      },
     }),
     
     // Sleep modal
@@ -5153,51 +5264,139 @@ const WaterModal = ({ data, onClose, onSave }) => {
   );
 };
 
-const StepsModal = ({ data, onClose, onSave }) => {
-  const [val, setVal] = uS(String(data.steps));
+const StepsModal = ({ data, onClose, onSave, onAddEntry, onDeleteEntry }) => {
+  const [val, setVal] = uS("");
   const [forDate, setForDate] = uS(null);
+  const [customTime, setCustomTime] = uS("");
   
-  // Show that day's existing value when backdating
+  // Get current entries for the selected date
+  const getEntriesForDate = () => {
+    if (!forDate) return data.stepEntries || [];
+    const targetDateStr = fromLocalISO(forDate).toDateString();
+    const dayEntry = (data.coachingHistory || []).find(d => d.date === targetDateStr);
+    return dayEntry?.stepEntries || [];
+  };
+  const entries = getEntriesForDate();
+  // Sort by time
+  const sortedEntries = [...entries].sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+  const currentTotal = stepsFromEntries(entries);
+  const progress = Math.min(100, (currentTotal / data.stepsGoal) * 100);
+  
+  // Reset val when switching days
   uE(() => {
-    if (forDate) {
-      const targetDateStr = fromLocalISO(forDate).toDateString();
-      const dayEntry = (data.coachingHistory || []).find(d => d.date === targetDateStr);
-      setVal(String(dayEntry?.steps || 0));
-    } else {
-      setVal(String(data.steps));
-    }
+    setVal("");
+    setCustomTime("");
   }, [forDate]);
   
-  return e(Modal, { onClose, title: "Update steps" },
+  const handleAddEntry = () => {
+    const count = parseInt(val) || 0;
+    if (count <= 0) return;
+    const time = customTime || new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    const entry = {
+      time,
+      count,
+      dateISO: new Date().toISOString(),
+    };
+    onAddEntry(entry, forDate);
+    setVal("");
+    setCustomTime("");
+  };
+  
+  return e(Modal, { onClose, title: "Steps so far" },
     e('p', { className: "text-zinc-500 text-sm mb-4" }, 
-      "Manually log your total steps."
+      "Log your current cumulative step count. Add multiple readings throughout the day — the latest count wins."
     ),
     e(DateChips, { selectedDate: forDate, onChange: setForDate }),
-    !forDate && e('div', { className: "bg-zinc-800 rounded-2xl p-4 mb-4" },
-      e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-1" }, "Currently logged"),
-      e('p', { className: "text-white text-3xl font-display font-bold" }, data.steps.toLocaleString()),
-      e('p', { className: "text-zinc-500 text-xs font-mono-d" }, `of ${data.stepsGoal.toLocaleString()} goal`)
-    ),
-    e('input', { 
-      value: val,
-      onChange: (ev) => setVal(ev.target.value),
-      type: "number",
-      placeholder: "e.g. 9500",
-      className: "w-full bg-zinc-800 text-white text-2xl font-display font-bold rounded-xl px-4 py-4 mb-4 placeholder-zinc-600 outline-none focus:ring-2 focus:ring-emerald-400 text-center"
-    }),
-    e('div', { className: "flex gap-3" },
-      e('button', { 
-        onClick: onClose,
-        className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
-      }, "Cancel"),
-      e('button', { 
-        onClick: () => onSave(parseInt(val) || 0, forDate),
-        className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
-      },
-        e(Icon, { d: icons.check, size: 18, stroke: "black" }),
-        forDate ? "Save to " + new Date(fromLocalISO(forDate)).toLocaleDateString('en-US', { weekday: 'short' }) : "Save"
+    
+    // Current total + progress
+    e('div', { className: "bg-zinc-800 rounded-2xl p-4 mb-4" },
+      e('div', { className: "flex justify-between items-baseline mb-2" },
+        e('div', null,
+          e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-0.5" }, 
+            forDate ? "That day's total" : "Today's total"
+          ),
+          e('p', { className: "text-white text-3xl font-display font-bold" }, currentTotal.toLocaleString()),
+          e('p', { className: "text-zinc-500 text-xs font-mono-d" }, `of ${data.stepsGoal.toLocaleString()} goal`)
+        ),
+        e('div', { className: "text-right" },
+          e('p', { className: `text-2xl font-display font-bold ${progress >= 100 ? 'text-emerald-400' : progress >= 70 ? 'text-cyan-400' : progress >= 30 ? 'text-yellow-400' : 'text-orange-400'}` }, 
+            `${Math.round(progress)}%`
+          )
+        )
+      ),
+      e('div', { className: "h-2 bg-zinc-900 rounded-full overflow-hidden" },
+        e('div', { 
+          className: `h-full rounded-full transition-all duration-500 ${progress >= 100 ? 'bg-emerald-400' : progress >= 70 ? 'bg-cyan-400' : progress >= 30 ? 'bg-yellow-400' : 'bg-orange-400'}`,
+          style: { width: `${progress}%` }
+        })
       )
-    )
+    ),
+    
+    // Add new entry section
+    e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, "Add reading"),
+    e('div', { className: "flex gap-2 mb-2" },
+      e('input', { 
+        value: val,
+        onChange: (ev) => setVal(ev.target.value),
+        type: "number",
+        placeholder: "Steps so far",
+        className: "flex-1 bg-zinc-800 text-white text-lg font-display font-bold rounded-xl px-4 py-3 placeholder-zinc-600 outline-none focus:ring-2 focus:ring-emerald-400"
+      }),
+      e('input', { 
+        value: customTime,
+        onChange: (ev) => setCustomTime(ev.target.value),
+        type: "time",
+        className: "w-24 bg-zinc-800 text-white text-sm font-mono-d rounded-xl px-3 py-3 outline-none focus:ring-2 focus:ring-emerald-400"
+      })
+    ),
+    e('p', { className: "text-[10px] text-zinc-600 font-mono-d mb-3" }, 
+      customTime ? `Will log at ${customTime}` : `Will log at ${new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} (now)`
+    ),
+    e('button', { 
+      onClick: handleAddEntry,
+      disabled: !val || parseInt(val) <= 0,
+      className: `w-full rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2 mb-4 ${val && parseInt(val) > 0 ? 'bg-emerald-400 text-black active:scale-95' : 'bg-zinc-800 text-zinc-600'}`
+    },
+      e(Icon, { d: icons.plus, size: 18, stroke: val && parseInt(val) > 0 ? "black" : "currentColor" }),
+      forDate ? `Add reading for ${new Date(fromLocalISO(forDate)).toLocaleDateString('en-US', { weekday: 'short' })}` : "Add reading"
+    ),
+    
+    // Existing entries list
+    sortedEntries.length > 0 && e(React.Fragment, null,
+      e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, 
+        `${sortedEntries.length} reading${sortedEntries.length > 1 ? 's' : ''} · long-press to delete`
+      ),
+      e('div', { className: "space-y-2 mb-3 max-h-48 overflow-y-auto scrollbar-hide" },
+        sortedEntries.map((entry, i) => {
+          const isLatest = entry.count === currentTotal;
+          return e('button', {
+            key: i,
+            onClick: () => {
+              if (confirm(`Delete reading at ${entry.time} (${entry.count.toLocaleString()} steps)?`)) {
+                onDeleteEntry(entry, forDate);
+              }
+            },
+            className: `w-full flex items-center gap-3 p-3 rounded-xl active:scale-[0.98] text-left ${isLatest ? 'bg-emerald-500/10 border border-emerald-500/30' : 'bg-zinc-800 border border-white/5'}`
+          },
+            e('div', { className: "w-12 text-center" },
+              e('p', { className: `font-mono-d text-xs ${isLatest ? 'text-emerald-300' : 'text-zinc-400'}` }, entry.time)
+            ),
+            e('div', { className: "flex-1" },
+              e('p', { className: `font-display font-bold ${isLatest ? 'text-white' : 'text-zinc-300'}` }, 
+                entry.count.toLocaleString(),
+                e('span', { className: "text-zinc-500 text-xs ml-1 font-normal" }, "steps")
+              )
+            ),
+            isLatest && e('span', { className: "text-[9px] bg-emerald-500/30 text-emerald-300 px-1.5 py-0.5 rounded font-mono-d uppercase" }, "current")
+          );
+        })
+      )
+    ),
+    
+    e('button', { 
+      onClick: onClose,
+      className: "w-full bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+    }, "Done")
   );
 };
 
