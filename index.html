@@ -248,7 +248,7 @@ const estimateIngredientProtein = (name, amount, unit) => {
 
 // ============== STORAGE LAYER ==============
 const STORAGE_KEY = "fitsync_v1";
-const SCHEMA_VERSION = 3; // Increment when changing data structure
+const SCHEMA_VERSION = 4; // Increment when changing data structure
 const BACKUP_REMINDER_DAYS = 5; // Remind user to backup after this many days
 
 // ============== TIMEZONE-SAFE DATE HELPERS ==============
@@ -349,6 +349,23 @@ const defaultData = {
   schemaVersion: SCHEMA_VERSION,
   // Track last backup time to nudge user
   lastBackupISO: null,
+  // Customizable home dashboard panel order
+  panelOrder: [
+    "mission",      // Today overview / mission status (NEW hero card)
+    "momentum",     // Momentum tracker (NEW)
+    "recovery",     // Recovery readiness (NEW)
+    "weight_goal",  // Weight goal banner
+    "health_score", // Health score 0-100
+    "protein",      // Protein tracking
+    "energy_balance", // Energy balance / deficit
+    "schedule",     // Weekly workout schedule
+    "ai_coaching",  // AI coaching preview
+    "smart_tips",   // Quick tips (rule-based)
+    "forecast",     // Weight forecast (NEW)
+    "stats_grid",   // Steps / water / sleep / HR
+    "body_weight",  // Body weight panel
+    "todays_training", // Today's training
+  ],
 };
 
 // ============== BMR / TDEE CALCULATIONS ==============
@@ -1142,6 +1159,230 @@ const calculateHealthScore = (data, sleepData, exerciseProgress) => {
   return { total, dimensions, topTip, grade, gradeColor };
 };
 
+// ============== MOMENTUM ENGINE ==============
+// Tracks consistency without punishing perfection.
+// "Healthy day" = at least 1 meal logged AND (workout-on-target-day OR rest-on-rest-day OR sleep ≥ 6h logged)
+// Score: 0-10, based on % of healthy days in last 14
+const calculateMomentum = (data) => {
+  const today = new Date().toDateString();
+  const archived = data.coachingHistory || [];
+  const days = [];
+  
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const dStr = d.toDateString();
+    const dayIdx = d.getDay();
+    const target = (data.workoutSchedule || {})[dayIdx];
+    
+    let meals = [], workouts = [], sleepHours = null;
+    
+    if (dStr === today) {
+      meals = data.meals || [];
+      workouts = data.workouts || [];
+      sleepHours = data.sleepHours;
+    } else {
+      const archDay = archived.find(a => a.date === dStr);
+      if (archDay) {
+        meals = archDay.meals || [];
+        sleepHours = archDay.sleepHours;
+      }
+      const archWorkouts = (data.workoutHistory || []).filter(w => w.date === dStr);
+      workouts = archWorkouts;
+    }
+    
+    // Determine if day was "healthy"
+    const loggedFood = meals.length >= 1;
+    const trainedOnTargetDay = target === 'workout' && workouts.length > 0;
+    const restedOnRestDay = target === 'rest' && workouts.length === 0;
+    const sleptEnough = sleepHours !== null && sleepHours >= 6;
+    const flexDay = !target;
+    
+    // Healthy = food logged AND one of: workout on training day, rest on rest day, sleep on flex day
+    const isHealthy = loggedFood && (trainedOnTargetDay || restedOnRestDay || flexDay || sleptEnough);
+    
+    days.push({ date: dStr, isHealthy, loggedFood, trainedOnTargetDay, restedOnRestDay, sleepHours, isToday: dStr === today });
+  }
+  
+  // Last 7 days for the headline number
+  const last7 = days.slice(-7);
+  const healthy7 = last7.filter(d => d.isHealthy).length;
+  
+  // Last 14 days for trend
+  const healthy14 = days.filter(d => d.isHealthy).length;
+  
+  // Score 0-10: ratio of healthy days
+  const score = Math.round((healthy7 / 7) * 10);
+  
+  let label, color, message;
+  if (score >= 9) { label = "On fire"; color = "emerald"; message = "Locked in — 6-7 healthy days this week"; }
+  else if (score >= 7) { label = "Building"; color = "cyan"; message = `${healthy7} healthy days this week — momentum building`; }
+  else if (score >= 5) { label = "Steady"; color = "yellow"; message = `${healthy7} healthy days · keep showing up`; }
+  else if (score >= 3) { label = "Slipping"; color = "orange"; message = `Only ${healthy7} healthy days — get back on track tomorrow`; }
+  else { label = "Reset needed"; color = "rose"; message = "Tough stretch. Just log one meal today."; }
+  
+  return {
+    score,
+    healthy7,
+    healthy14,
+    label,
+    color,
+    message,
+    days, // last 14 days for visualization
+  };
+};
+
+// ============== RECOVERY READINESS ENGINE ==============
+// Whoop/Garmin-style green/yellow/red score for whether to train hard today.
+// Based on: last night sleep, recent training load, recent energy levels.
+const calculateRecoveryReadiness = (data) => {
+  let score = 50; // baseline
+  let factors = [];
+  
+  // Last night's sleep (0-30 points contribution to score)
+  const sleep = data.sleepHours;
+  if (sleep !== null && sleep !== undefined) {
+    if (sleep >= 7.5) { score += 25; factors.push({ label: "Great sleep", value: `${sleep}h`, sign: "+" }); }
+    else if (sleep >= 7) { score += 15; factors.push({ label: "Good sleep", value: `${sleep}h`, sign: "+" }); }
+    else if (sleep >= 6) { score += 5; factors.push({ label: "OK sleep", value: `${sleep}h`, sign: "·" }); }
+    else if (sleep >= 5) { score -= 10; factors.push({ label: "Low sleep", value: `${sleep}h`, sign: "−" }); }
+    else { score -= 25; factors.push({ label: "Very low sleep", value: `${sleep}h`, sign: "−−" }); }
+  } else {
+    factors.push({ label: "Sleep not logged", value: "—", sign: "?" });
+  }
+  
+  // Recent training load — look at last 3 days
+  const today = new Date().toDateString();
+  const recentDays = [];
+  for (let i = 0; i < 3; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    recentDays.push(d.toDateString());
+  }
+  let recentVolume = 0;
+  let recentSessions = 0;
+  for (const dStr of recentDays) {
+    const items = dStr === today 
+      ? (data.workouts || []) 
+      : (data.workoutHistory || []).filter(w => w.date === dStr);
+    for (const w of items) {
+      recentVolume += w.totalVolume || 0;
+      recentSessions++;
+    }
+  }
+  
+  if (recentSessions >= 3) {
+    score -= 15;
+    factors.push({ label: "Heavy 3-day load", value: `${recentSessions} sessions`, sign: "−" });
+  } else if (recentSessions === 2) {
+    score -= 5;
+    factors.push({ label: "Moderate load", value: "2 sessions", sign: "·" });
+  } else if (recentSessions === 0) {
+    score += 10;
+    factors.push({ label: "Well rested", value: "0 sessions", sign: "+" });
+  }
+  
+  // Recent energy levels (last 3 workouts)
+  const allWorkouts = [...(data.workoutHistory || []), ...(data.workouts || [])];
+  const recentEnergy = allWorkouts
+    .filter(w => w.energyLevel)
+    .slice(-3);
+  if (recentEnergy.length > 0) {
+    const avgEnergy = recentEnergy.reduce((s, w) => s + w.energyLevel, 0) / recentEnergy.length;
+    if (avgEnergy >= 4) { score += 10; factors.push({ label: "High recent energy", value: `${avgEnergy.toFixed(1)}/5`, sign: "+" }); }
+    else if (avgEnergy <= 2.5) { score -= 15; factors.push({ label: "Low recent energy", value: `${avgEnergy.toFixed(1)}/5`, sign: "−" }); }
+  }
+  
+  score = Math.max(0, Math.min(100, score));
+  
+  let status, color, recommendation;
+  if (score >= 75) { 
+    status = "Train hard"; color = "emerald"; 
+    recommendation = "Body's ready — push intensity, hit PRs"; 
+  } else if (score >= 55) { 
+    status = "Moderate"; color = "yellow"; 
+    recommendation = "Train normally, don't max out"; 
+  } else if (score >= 35) { 
+    status = "Easy day"; color = "orange"; 
+    recommendation = "Light session or active recovery"; 
+  } else { 
+    status = "Rest day"; color = "rose"; 
+    recommendation = "Body needs recovery — stretch, walk, sleep"; 
+  }
+  
+  return { score, status, color, recommendation, factors };
+};
+
+// ============== WEIGHT FORECAST ENGINE ==============
+// Projects weight in 14 days based on current trajectory + today's caloric balance.
+// Uses 7700 kcal ≈ 1 kg fat as the conversion rate.
+const calculateForecast = (data, balance, tdee) => {
+  const wHist = data.weightHistory || [];
+  const current = data.bodyWeight;
+  const target = data.targetWeight;
+  
+  // If we have weight history, use the actual rate; otherwise estimate from today's balance
+  let kgPerWeek = 0;
+  let basis = "estimate";
+  
+  if (wHist.length >= 3) {
+    // Use linear regression on last 4 weeks of data
+    const recent = wHist.slice(-Math.min(8, wHist.length));
+    const oldestDate = new Date(recent[0].date).getTime();
+    const newestDate = new Date(recent[recent.length - 1].date).getTime();
+    const daysSpan = (newestDate - oldestDate) / (1000 * 60 * 60 * 24);
+    if (daysSpan > 0) {
+      const weightChange = recent[recent.length - 1].weight - recent[0].weight;
+      kgPerWeek = (weightChange / daysSpan) * 7;
+      basis = "history";
+    }
+  } else {
+    // Estimate from today's balance: balance kcal/day → kg/week via 7700 kcal/kg
+    kgPerWeek = (balance * 7) / 7700;
+    basis = "today";
+  }
+  
+  const projection7 = current + kgPerWeek;
+  const projection14 = current + (kgPerWeek * 2);
+  const projection28 = current + (kgPerWeek * 4);
+  
+  // Days to target
+  let daysToTarget = null;
+  if (kgPerWeek !== 0) {
+    const direction = data.goalType === "cut" ? -1 : data.goalType === "bulk" ? 1 : 0;
+    const distance = target - current;
+    if ((direction === -1 && kgPerWeek < 0) || (direction === 1 && kgPerWeek > 0)) {
+      daysToTarget = Math.round(Math.abs(distance / kgPerWeek) * 7);
+    }
+  }
+  
+  // Sustainable range check
+  const goalLabel = data.goalType;
+  let sustainable = "ok";
+  let warning = null;
+  if (goalLabel === "cut") {
+    if (kgPerWeek < -1) { sustainable = "too_aggressive"; warning = "Losing too fast — risk of muscle loss"; }
+    else if (kgPerWeek >= 0) { sustainable = "stalled"; warning = "Not in deficit — adjust intake"; }
+    else if (kgPerWeek > -0.2) { sustainable = "slow"; warning = "Slow progress — small deficit"; }
+  } else if (goalLabel === "bulk") {
+    if (kgPerWeek > 0.5) { sustainable = "too_aggressive"; warning = "Gaining too fast — risk of fat gain"; }
+    else if (kgPerWeek <= 0) { sustainable = "stalled"; warning = "Not in surplus — adjust intake"; }
+  }
+  
+  return {
+    current,
+    target,
+    kgPerWeek: Math.round(kgPerWeek * 100) / 100,
+    projection7: Math.round(projection7 * 10) / 10,
+    projection14: Math.round(projection14 * 10) / 10,
+    projection28: Math.round(projection28 * 10) / 10,
+    daysToTarget,
+    sustainable,
+    warning,
+    basis,
+  };
+};
+
 // ============== AI COACHING (Claude API) ==============
 // Builds a comprehensive prompt with all user data and asks Claude for personalized advice.
 const generateAICoaching = async (data, apiKey) => {
@@ -1219,30 +1460,39 @@ const generateAICoaching = async (data, apiKey) => {
     weightTrend: weightTrend,
   };
   
-  const systemPrompt = `You are an expert fitness and nutrition coach giving personalized daily advice.
+  const systemPrompt = `You are a fitness coach. Speak like a top athlete's coach: short, direct, no fluff.
 
-Your job: analyze the user's data and produce a JSON response with concrete, specific tips for tomorrow.
+Tone rules — STRICTLY:
+- Each title: 2-4 words MAX. Like push notifications. "Sleep low.", "Protein gap.", "Solid week."
+- Each detail: 1 short sentence MAX, with a specific number or action. "Add 30g protein tonight." not "Make sure to add more protein to your evening meal."
+- NO greetings, NO preamble, NO "Based on your data...", NO "Great job!", NO motivational fluff.
+- NO emoji in titles or details (UI handles those).
+- Tell them what to DO, not how they're "doing".
+- If something is fine, just say so briefly. Don't manufacture concerns.
 
-Style rules:
-- Be direct, actionable, and specific. Give numbers, durations, exact suggestions.
-- Use the user's actual data (workouts, meals, weight trend) to back up advice.
-- Don't be generic. "Eat more protein" is bad. "Add 30g protein at breakfast — try eggs or Greek yogurt" is good.
-- If they did StairMaster, suggest specific level/duration adjustments.
-- If they're cutting and balance was wrong today, calculate the gap and suggest specific fixes.
-- Be honest if they're doing well — don't manufacture problems.
-- Tomorrow tips should be planned for tomorrow specifically (e.g. "tomorrow's training: focus on legs since you've done 2 pulls this week").
+Examples of good output:
+- title: "Sleep low.", detail: "6.2h avg this week. Aim for 7.5h tonight."
+- title: "Protein gap.", detail: "120g logged, 145g target. Add a shake."
+- title: "Push lagging.", detail: "Bench stalled 3 weeks. Drop to 80kg, push reps."
+- title: "On track.", detail: "Cut pace solid at -0.4kg/week."
 
-Output ONLY valid JSON in this exact schema, nothing else:
+Examples of BAD output (do not produce):
+- title: "Hello! How are you?", detail: "I noticed you might want to consider..."
+- title: "Great job today!", detail: "You're doing amazing keep it up..."
+
+Output ONLY valid JSON, no markdown:
 {
-  "summary": "1-2 sentence overall assessment of today",
+  "summary": "ONE short punchy line about today. 5-10 words.",
   "today_review": [
-    {"category": "nutrition" | "training" | "recovery" | "hydration", "title": "short title", "detail": "specific advice with numbers"}
+    {"category": "nutrition" | "training" | "recovery" | "hydration", "title": "2-4 words", "detail": "1 sentence with numbers"}
   ],
   "tomorrow_plan": [
-    {"category": "nutrition" | "training" | "recovery" | "hydration", "title": "short title", "detail": "specific advice with numbers"}
+    {"category": "nutrition" | "training" | "recovery" | "hydration", "title": "2-4 words", "detail": "1 sentence with numbers"}
   ],
-  "weekly_insight": "1-2 sentences spotting a pattern across the week"
-}`;
+  "weekly_insight": "ONE sentence spotting a pattern. 10-15 words max."
+}
+
+Aim for 2-3 items in today_review and 2-3 in tomorrow_plan. Quality over quantity.`;
 
   const userMessage = `Here is my fitness data:\n\n${JSON.stringify(userContext, null, 2)}\n\nGive me a coaching review of today and a specific plan for tomorrow.`;
 
@@ -1336,6 +1586,17 @@ const migrations = {
           protein: 22, carbs: 3, fats: 1,
           ingredients: [{ name: "ESN whey", grams: 30, kcal: 115, protein: 22 }]
         },
+      ];
+    }
+    return data;
+  },
+  // From version 3 → 4: add panelOrder for customizable dashboard
+  4: (data) => {
+    if (!data.panelOrder || !Array.isArray(data.panelOrder)) {
+      data.panelOrder = [
+        "mission", "momentum", "recovery", "weight_goal", "health_score",
+        "protein", "energy_balance", "schedule", "ai_coaching", "smart_tips",
+        "forecast", "stats_grid", "body_weight", "todays_training",
       ];
     }
     return data;
@@ -1949,6 +2210,78 @@ const icons = {
 };
 
 // ============== MAIN APP ==============
+// ============== DASHBOARD PANEL WRAPPER ==============
+// Wraps a panel with edit-mode reorder controls (up/down/hide).
+// On long-press, edit mode activates and shows up/down arrows on each panel.
+const PanelWrapper = ({ id, label, editMode, isFirst, isLast, onMoveUp, onMoveDown, onHide, onLongPress, children }) => {
+  const pressTimerRef = uR(null);
+  const startedRef = uR(false);
+  
+  const startPress = () => {
+    if (editMode) return; // already in edit mode
+    startedRef.current = true;
+    pressTimerRef.current = setTimeout(() => {
+      if (startedRef.current && navigator.vibrate) navigator.vibrate(50);
+      if (startedRef.current) onLongPress();
+    }, 600);
+  };
+  
+  const cancelPress = () => {
+    startedRef.current = false;
+    if (pressTimerRef.current) {
+      clearTimeout(pressTimerRef.current);
+      pressTimerRef.current = null;
+    }
+  };
+  
+  if (!editMode) {
+    return e('div', { 
+      className: "relative",
+      onTouchStart: startPress,
+      onTouchEnd: cancelPress,
+      onTouchCancel: cancelPress,
+      onTouchMove: cancelPress,
+      onMouseDown: startPress,
+      onMouseUp: cancelPress,
+      onMouseLeave: cancelPress,
+    }, children);
+  }
+  
+  // Edit mode: show controls overlay
+  return e('div', { className: "relative mb-4" },
+    // The panel itself, with edit-mode visual treatment
+    e('div', { className: "ring-2 ring-emerald-400/50 rounded-3xl overflow-visible relative" }, 
+      // Panel content (kept interactive for visibility but click-protected)
+      e('div', { 
+        className: "pointer-events-none opacity-90",
+        style: { marginBottom: 0 }
+      }, children),
+      // Top-right control: hide
+      e('button', {
+        onClick: (ev) => { ev.stopPropagation(); onHide(); },
+        className: "absolute top-2 right-2 w-8 h-8 rounded-full bg-rose-500/30 border border-rose-400 flex items-center justify-center active:scale-90 z-10"
+      }, e('span', { className: "text-rose-200 text-base font-bold leading-none" }, "×")),
+      // Bottom-right: label
+      e('div', {
+        className: "absolute bottom-2 right-2 bg-emerald-500/90 text-black text-[9px] font-mono-d uppercase px-2 py-0.5 rounded font-bold pointer-events-none"
+      }, label),
+    ),
+    // Move up/down buttons
+    e('div', { className: "flex gap-2 mt-2 justify-center" },
+      e('button', {
+        onClick: onMoveUp,
+        disabled: isFirst,
+        className: `flex-1 max-w-[140px] rounded-xl py-2.5 text-xs font-display font-semibold flex items-center justify-center gap-1 ${isFirst ? 'bg-zinc-900 text-zinc-700' : 'bg-zinc-800 text-emerald-400 active:scale-95'}`
+      }, "↑ Move up"),
+      e('button', {
+        onClick: onMoveDown,
+        disabled: isLast,
+        className: `flex-1 max-w-[140px] rounded-xl py-2.5 text-xs font-display font-semibold flex items-center justify-center gap-1 ${isLast ? 'bg-zinc-900 text-zinc-700' : 'bg-zinc-800 text-emerald-400 active:scale-95'}`
+      }, "Move down ↓")
+    )
+  );
+};
+
 const App = () => {
   const [data, setData] = uS(loadData);
   const [activeTab, setActiveTab] = uS("home");
@@ -1956,6 +2289,7 @@ const App = () => {
   // Modals
   const [modal, setModal] = uS(null);
   const [editingMeal, setEditingMeal] = uS(null);
+  const [editingFavorite, setEditingFavorite] = uS(null);
   const [editingWorkout, setEditingWorkout] = uS(null);
   const [importing, setImporting] = uS(false);
   const [importProgress, setImportProgress] = uS(0);
@@ -1969,6 +2303,10 @@ const App = () => {
   // Photo state
   const [photos, setPhotos] = uS([]);
   const [photoStorage, setPhotoStorage] = uS(null);
+  const [dashboardEditMode, setDashboardEditMode] = uS(false);
+  const [longPressTimer, setLongPressTimer] = uS(null);
+  // Food tab: which date are we viewing? null = today
+  const [foodViewDate, setFoodViewDate] = uS(null); // "YYYY-MM-DD" or null for today
   
   // Load photos from IndexedDB
   uE(() => {
@@ -2043,6 +2381,84 @@ const App = () => {
   const isTooAggressive = data.goalType === "cut" ? balance < goalRange.min : balance > goalRange.max;
 
   const updateData = (patch) => setData(prev => ({ ...prev, ...patch }));
+  
+  // Dashboard panel reordering
+  const movePanelUp = (id) => {
+    const order = [...(data.panelOrder || [])];
+    const idx = order.indexOf(id);
+    if (idx > 0) {
+      [order[idx - 1], order[idx]] = [order[idx], order[idx - 1]];
+      updateData({ panelOrder: order });
+    }
+  };
+  const movePanelDown = (id) => {
+    const order = [...(data.panelOrder || [])];
+    const idx = order.indexOf(id);
+    if (idx >= 0 && idx < order.length - 1) {
+      [order[idx], order[idx + 1]] = [order[idx + 1], order[idx]];
+      updateData({ panelOrder: order });
+    }
+  };
+  const hidePanel = (id) => {
+    updateData({ panelOrder: (data.panelOrder || []).filter(p => p !== id) });
+  };
+  const showPanel = (id) => {
+    if (!(data.panelOrder || []).includes(id)) {
+      updateData({ panelOrder: [...(data.panelOrder || []), id] });
+    }
+  };
+  const resetPanelOrder = () => {
+    updateData({ panelOrder: [
+      "mission", "momentum", "recovery", "weight_goal", "health_score",
+      "protein", "energy_balance", "schedule", "ai_coaching", "smart_tips",
+      "forecast", "stats_grid", "body_weight", "todays_training",
+    ]});
+  };
+  
+  // ============ BACKDATING HELPERS for daily metrics ============
+  // Updates a single field (steps/water/sleepHours/restingHR) for a specific past date.
+  // If forDate is null, updates today's data normally.
+  const setMetricForDate = (field, value, forDate) => {
+    if (!forDate) {
+      // Today
+      updateData({ [field]: value });
+      return;
+    }
+    const targetDateStr = fromLocalISO(forDate).toDateString();
+    const history = [...(data.coachingHistory || [])];
+    let dayEntry = history.find(d => d.date === targetDateStr);
+    if (!dayEntry) {
+      dayEntry = { 
+        date: targetDateStr, meals: [], workouts: [],
+        water: 0, steps: 0, sleepHours: null,
+        totalEaten: 0, totalBurned: 0,
+      };
+      history.push(dayEntry);
+    }
+    dayEntry[field] = value;
+    
+    // For sleep, also append to sleepHistory so trends pick it up
+    if (field === 'sleepHours') {
+      const sleepHist = [...(data.sleepHistory || [])].filter(s => s.date !== targetDateStr);
+      sleepHist.push({
+        date: targetDateStr,
+        dateISO: fromLocalISO(forDate).toISOString(),
+        hours: value,
+      });
+      sleepHist.sort((a, b) => new Date(a.dateISO) - new Date(b.dateISO));
+      updateData({ coachingHistory: history.slice(-30), sleepHistory: sleepHist.slice(-90) });
+    } else {
+      updateData({ coachingHistory: history.slice(-30) });
+    }
+  };
+  
+  // Get a metric value for a specific past date (for showing existing values when backdating)
+  const getMetricForDate = (field, forDate) => {
+    if (!forDate) return data[field];
+    const targetDateStr = fromLocalISO(forDate).toDateString();
+    const dayEntry = (data.coachingHistory || []).find(d => d.date === targetDateStr);
+    return dayEntry ? dayEntry[field] : null;
+  };
 
   // ============ HANDLERS ============
   const handleScreenshotImport = async (files) => {
@@ -2151,7 +2567,11 @@ const App = () => {
     }, "Tap Share → Add to Home Screen for the full app experience"),
     
     // ============ HOME TAB ============
-    activeTab === "home" && e('div', { className: "px-5 pt-4" },
+    activeTab === "home" && (() => {
+      const visiblePanels = data.panelOrder || [];
+      const isVisible = (id) => visiblePanels.includes(id);
+      
+      return e('div', { className: "px-5 pt-4" },
       
       // Header
       e('div', { className: "flex justify-between items-start mb-6" },
@@ -2165,6 +2585,11 @@ const App = () => {
           )
         ),
         e('div', { className: "flex gap-2 items-center" },
+          // Customize dashboard button
+          e('button', { 
+            onClick: () => setModal('customize'),
+            className: "w-11 h-11 rounded-full bg-zinc-900 border border-white/5 flex items-center justify-center active:scale-95"
+          }, e('span', { className: "text-zinc-400 text-base" }, "⚙")),
           // Backup button — shows orange dot if backup is overdue
           e('button', { 
             onClick: () => setModal('backup'),
@@ -2192,8 +2617,297 @@ const App = () => {
         e(Icon, { d: icons.chevron, size: 16, className: "text-orange-400" })
       ),
 
+      // ====================================================================
+      // ALL DASHBOARD PANELS — rendered in order from data.panelOrder
+      // Build panel content map, then render in user's chosen order
+      // ====================================================================
+      (() => {
+        const visiblePanels = data.panelOrder || [];
+        
+        const panels = {
+          // ─── MISSION STATUS (NEW hero card) ───
+          mission: () => {
+            const sleepData = buildSleepData(data.sleepHistory, data.sleepHours);
+            const exerciseProgress = buildExerciseProgress(data.workoutHistory, data.workouts);
+            const recovery = calculateRecoveryReadiness(data);
+            const todaySchedule = (data.workoutSchedule || {})[new Date().getDay()];
+            const workoutDoneToday = data.workouts.length > 0;
+            const proteinPct = Math.min(100, (totalProtein / proteinGoal) * 100);
+            const calLeft = data.caloriesGoal - totalEaten;
+            const calsPct = Math.min(100, (totalEaten / data.caloriesGoal) * 100);
+            
+            return e('div', { className: "rounded-3xl bg-gradient-to-br from-emerald-500/15 via-zinc-900 to-zinc-900 p-5 mb-4 border border-emerald-500/20 relative overflow-hidden" },
+              e('div', { className: "absolute -top-16 -right-16 w-48 h-48 rounded-full bg-emerald-500/10 blur-3xl" }),
+              e('div', { className: "relative" },
+                e('div', { className: "flex justify-between items-center mb-4" },
+                  e('div', null,
+                    e('p', { className: "text-emerald-400 text-[10px] font-mono-d uppercase tracking-widest" }, "Mission status"),
+                    e('p', { className: "text-white font-display font-bold text-base mt-0.5" }, "Today's targets")
+                  ),
+                  e('div', { className: `w-12 h-12 rounded-2xl flex items-center justify-center text-2xl bg-${recovery.color}-500/20 border border-${recovery.color}-400/40` }, 
+                    recovery.color === "emerald" ? "🟢" : recovery.color === "yellow" ? "🟡" : recovery.color === "orange" ? "🟠" : "🔴"
+                  )
+                ),
+                
+                // Stat rows: calories, protein, training, recovery
+                e('div', { className: "space-y-2.5" },
+                  // Calories
+                  e('div', { className: "flex items-center gap-3" },
+                    e('div', { className: "w-7 text-base text-center" }, "🔥"),
+                    e('div', { className: "flex-1" },
+                      e('div', { className: "flex justify-between items-center mb-0.5" },
+                        e('span', { className: "text-zinc-300 text-xs font-display" }, "Calories"),
+                        e('span', { className: "text-white text-xs font-mono-d font-bold" }, 
+                          calLeft >= 0 ? `${calLeft} left` : `${Math.abs(calLeft)} over`
+                        )
+                      ),
+                      e('div', { className: "h-1.5 bg-zinc-800 rounded-full overflow-hidden" },
+                        e('div', { 
+                          className: `h-full rounded-full ${calsPct > 105 ? 'bg-rose-400' : calsPct >= 85 ? 'bg-emerald-400' : 'bg-cyan-400'}`,
+                          style: { width: `${Math.min(100, calsPct)}%` }
+                        })
+                      )
+                    )
+                  ),
+                  // Protein
+                  e('div', { className: "flex items-center gap-3" },
+                    e('div', { className: "w-7 text-base text-center" }, "🥩"),
+                    e('div', { className: "flex-1" },
+                      e('div', { className: "flex justify-between items-center mb-0.5" },
+                        e('span', { className: "text-zinc-300 text-xs font-display" }, "Protein"),
+                        e('span', { className: "text-white text-xs font-mono-d font-bold" }, 
+                          `${Math.round(totalProtein)}/${proteinGoal}g`
+                        )
+                      ),
+                      e('div', { className: "h-1.5 bg-zinc-800 rounded-full overflow-hidden" },
+                        e('div', { 
+                          className: `h-full rounded-full ${proteinPct >= 80 ? 'bg-emerald-400' : proteinPct >= 50 ? 'bg-yellow-400' : 'bg-orange-400'}`,
+                          style: { width: `${proteinPct}%` }
+                        })
+                      )
+                    )
+                  ),
+                  // Training
+                  e('div', { className: "flex items-center gap-3" },
+                    e('div', { className: "w-7 text-base text-center" }, "💪"),
+                    e('div', { className: "flex-1 flex justify-between items-center" },
+                      e('span', { className: "text-zinc-300 text-xs font-display" }, 
+                        todaySchedule === 'rest' ? "Rest day" :
+                        todaySchedule === 'workout' ? "Training planned" :
+                        "Flex day"
+                      ),
+                      e('span', { className: `text-xs font-mono-d font-bold ${workoutDoneToday ? 'text-emerald-400' : todaySchedule === 'rest' ? 'text-zinc-500' : 'text-orange-400'}` }, 
+                        workoutDoneToday ? "✓ done" : 
+                        todaySchedule === 'rest' ? "✓ resting" : "pending"
+                      )
+                    )
+                  ),
+                  // Recovery
+                  e('div', { className: "flex items-center gap-3" },
+                    e('div', { className: "w-7 text-base text-center" }, "🔋"),
+                    e('div', { className: "flex-1 flex justify-between items-center" },
+                      e('span', { className: "text-zinc-300 text-xs font-display" }, "Recovery"),
+                      e('span', { className: `text-xs font-mono-d font-bold ${recovery.color === 'emerald' ? 'text-emerald-400' : recovery.color === 'yellow' ? 'text-yellow-400' : recovery.color === 'orange' ? 'text-orange-400' : 'text-rose-400'}` }, 
+                        recovery.status
+                      )
+                    )
+                  )
+                ),
+                
+                // AI tip preview if available
+                data.coaching && data.coaching.summary && e('div', { 
+                  className: "mt-4 pt-3 border-t border-white/10 flex items-center gap-2",
+                  onClick: (ev) => { ev.stopPropagation(); setActiveTab("coach"); }
+                },
+                  e('span', { className: "text-yellow-400 text-base" }, "✨"),
+                  e('p', { className: "text-zinc-300 text-xs font-display flex-1 italic leading-snug" }, data.coaching.summary)
+                )
+              )
+            );
+          },
+          
+          // ─── MOMENTUM (NEW) ───
+          momentum: () => {
+            const m = calculateMomentum(data);
+            const colorMap = {
+              emerald: "from-emerald-500/15 to-emerald-500/5 border-emerald-500/30",
+              cyan: "from-cyan-500/15 to-cyan-500/5 border-cyan-500/30",
+              yellow: "from-yellow-500/15 to-yellow-500/5 border-yellow-500/30",
+              orange: "from-orange-500/15 to-orange-500/5 border-orange-500/30",
+              rose: "from-rose-500/15 to-rose-500/5 border-rose-500/30",
+            };
+            const textColor = {
+              emerald: "text-emerald-300",
+              cyan: "text-cyan-300",
+              yellow: "text-yellow-300",
+              orange: "text-orange-300",
+              rose: "text-rose-300",
+            };
+            const dotColor = {
+              emerald: "bg-emerald-400",
+              cyan: "bg-cyan-400",
+              yellow: "bg-yellow-400",
+              orange: "bg-orange-400",
+              rose: "bg-rose-400",
+            };
+            return e('div', { className: `rounded-2xl bg-gradient-to-br ${colorMap[m.color] || colorMap.cyan} p-4 mb-4 border` },
+              e('div', { className: "flex items-center gap-3 mb-3" },
+                e('span', { className: "text-2xl" }, m.score >= 7 ? "🔥" : m.score >= 5 ? "✨" : "🌱"),
+                e('div', { className: "flex-1" },
+                  e('div', { className: "flex items-baseline gap-2" },
+                    e('span', { className: `text-2xl font-display font-bold ${textColor[m.color] || 'text-white'}` }, m.score),
+                    e('span', { className: "text-zinc-500 text-xs font-mono-d" }, "/10"),
+                    e('span', { className: `text-xs font-display font-semibold ml-1 ${textColor[m.color] || 'text-white'}` }, m.label)
+                  ),
+                  e('p', { className: "text-zinc-400 text-[11px] font-mono-d" }, "Momentum")
+                )
+              ),
+              // Last 14 days dots
+              e('div', { className: "flex gap-1 mb-2" },
+                m.days.map((d, i) => e('div', {
+                  key: i,
+                  title: d.date,
+                  className: `flex-1 h-2.5 rounded ${
+                    d.isHealthy 
+                      ? (d.isToday ? (dotColor[m.color] || 'bg-emerald-400') : 'bg-emerald-500/50')
+                      : 'bg-zinc-800'
+                  } ${d.isToday ? 'ring-1 ring-white/40' : ''}`
+                }))
+              ),
+              e('p', { className: "text-zinc-300 text-xs font-display leading-snug" }, m.message)
+            );
+          },
+          
+          // ─── RECOVERY READINESS (NEW) ───
+          recovery: () => {
+            const r = calculateRecoveryReadiness(data);
+            const colorMap = {
+              emerald: { bg: "from-emerald-500/15 to-emerald-500/5", border: "border-emerald-500/30", text: "text-emerald-300", bar: "bg-emerald-400" },
+              yellow: { bg: "from-yellow-500/15 to-yellow-500/5", border: "border-yellow-500/30", text: "text-yellow-300", bar: "bg-yellow-400" },
+              orange: { bg: "from-orange-500/15 to-orange-500/5", border: "border-orange-500/30", text: "text-orange-300", bar: "bg-orange-400" },
+              rose: { bg: "from-rose-500/15 to-rose-500/5", border: "border-rose-500/30", text: "text-rose-300", bar: "bg-rose-400" },
+            };
+            const cs = colorMap[r.color] || colorMap.yellow;
+            return e('div', { className: `rounded-2xl bg-gradient-to-br ${cs.bg} p-4 mb-4 border ${cs.border}` },
+              e('div', { className: "flex justify-between items-start mb-3" },
+                e('div', null,
+                  e('p', { className: "text-zinc-400 text-[10px] font-mono-d uppercase tracking-wider" }, "Recovery"),
+                  e('div', { className: "flex items-baseline gap-2 mt-0.5" },
+                    e('span', { className: `text-3xl font-display font-bold ${cs.text}` }, r.score),
+                    e('span', { className: "text-zinc-500 text-xs font-mono-d" }, "/100")
+                  )
+                ),
+                e('div', { className: "text-right" },
+                  e('p', { className: `text-base font-display font-bold ${cs.text}` }, r.status),
+                  e('p', { className: "text-zinc-400 text-[10px] font-mono-d mt-0.5" }, r.recommendation)
+                )
+              ),
+              e('div', { className: "h-2 bg-zinc-800 rounded-full overflow-hidden mb-3" },
+                e('div', { 
+                  className: `h-full rounded-full ${cs.bar} transition-all duration-500`,
+                  style: { width: `${r.score}%` }
+                })
+              ),
+              // Factors
+              e('div', { className: "space-y-1" },
+                r.factors.slice(0, 3).map((f, i) => e('div', { key: i, className: "flex justify-between items-center" },
+                  e('span', { className: "text-zinc-400 text-[11px] font-mono-d" }, 
+                    `${f.sign === '+' ? '✓' : f.sign === '−' || f.sign === '−−' ? '✗' : f.sign === '?' ? '?' : '·'} ${f.label}`
+                  ),
+                  e('span', { className: "text-zinc-300 text-[11px] font-mono-d" }, f.value)
+                ))
+              )
+            );
+          },
+          
+          // ─── WEIGHT FORECAST (NEW) ───
+          forecast: () => {
+            const f = calculateForecast(data, balance, tdee);
+            if (f.basis === "today" && data.weightHistory.length === 0) {
+              return e('div', { className: "rounded-2xl bg-zinc-900/80 border border-white/5 p-4 mb-4" },
+                e('div', { className: "flex items-center gap-2 mb-2" },
+                  e('span', { className: "text-base" }, "🔮"),
+                  e('p', { className: "text-white font-display font-semibold text-sm" }, "Weight forecast")
+                ),
+                e('p', { className: "text-zinc-500 text-xs leading-snug" }, 
+                  "Log your weight a few times to see real projections"
+                )
+              );
+            }
+            
+            const direction = f.kgPerWeek < 0 ? "losing" : f.kgPerWeek > 0 ? "gaining" : "stable";
+            const arrowIcon = f.kgPerWeek < 0 ? "↓" : f.kgPerWeek > 0 ? "↑" : "→";
+            const trendColor = (data.goalType === "cut" && f.kgPerWeek < 0) || (data.goalType === "bulk" && f.kgPerWeek > 0) || (data.goalType === "maintain" && Math.abs(f.kgPerWeek) < 0.2)
+              ? "text-emerald-400" 
+              : "text-orange-400";
+            
+            return e('div', { className: "rounded-2xl bg-zinc-900/80 border border-white/5 p-4 mb-4" },
+              e('div', { className: "flex justify-between items-start mb-3" },
+                e('div', null,
+                  e('div', { className: "flex items-center gap-2 mb-1" },
+                    e('span', { className: "text-base" }, "🔮"),
+                    e('p', { className: "text-white font-display font-semibold text-sm" }, "Weight forecast")
+                  ),
+                  e('p', { className: "text-zinc-500 text-[10px] font-mono-d uppercase" }, 
+                    f.basis === "history" ? "Based on 4-week trend" : "Based on today's balance"
+                  )
+                ),
+                e('div', { className: "text-right" },
+                  e('p', { className: `font-display font-bold text-base ${trendColor}` }, 
+                    `${arrowIcon} ${Math.abs(f.kgPerWeek)} kg/wk`
+                  )
+                )
+              ),
+              // 3-week projection
+              e('div', { className: "grid grid-cols-3 gap-2 mb-3" },
+                e('div', { className: "bg-zinc-800/50 rounded-xl p-2.5 text-center" },
+                  e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase mb-0.5" }, "Now"),
+                  e('p', { className: "text-white font-display font-bold text-sm" }, 
+                    `${f.current}kg`
+                  )
+                ),
+                e('div', { className: "bg-zinc-800/50 rounded-xl p-2.5 text-center" },
+                  e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase mb-0.5" }, "+14d"),
+                  e('p', { className: `font-display font-bold text-sm ${trendColor}` }, 
+                    `${f.projection14}kg`
+                  )
+                ),
+                e('div', { className: "bg-zinc-800/50 rounded-xl p-2.5 text-center" },
+                  e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase mb-0.5" }, "+28d"),
+                  e('p', { className: `font-display font-bold text-sm ${trendColor}` }, 
+                    `${f.projection28}kg`
+                  )
+                )
+              ),
+              // Days to target / warning
+              f.warning ? 
+                e('div', { className: "bg-orange-500/10 border border-orange-500/30 rounded-lg p-2 flex items-center gap-2" },
+                  e('span', { className: "text-orange-400 text-xs" }, "⚠"),
+                  e('p', { className: "text-orange-200 text-[10px] font-mono-d leading-snug" }, f.warning)
+                ) :
+                f.daysToTarget && f.daysToTarget < 365 ?
+                  e('div', { className: "bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-2 flex items-center gap-2" },
+                    e('span', { className: "text-emerald-400 text-xs" }, "🎯"),
+                    e('p', { className: "text-emerald-200 text-[10px] font-mono-d" }, 
+                      `${f.daysToTarget} days to ${f.target}kg target at this pace`
+                    )
+                  ) : null
+            );
+          },
+        };
+        
+        // Build the panel render array based on panelOrder
+        // Some panels (existing inline ones) we keep where they are below
+        const newPanels = ["mission", "momentum", "recovery", "forecast"];
+        return e(React.Fragment, null,
+          ...visiblePanels
+            .filter(id => newPanels.includes(id) && panels[id])
+            .map(id => e(React.Fragment, { key: id }, panels[id]()))
+        );
+      })(),
+
       // Weight goal banner
-      e('button', { 
+      isVisible("weight_goal") && e('button', { 
         onClick: () => setModal('weight'),
         className: "w-full bg-gradient-to-r from-purple-500/20 via-pink-500/10 to-rose-500/20 rounded-2xl p-4 mb-4 border border-purple-500/20 flex items-center gap-3 active:scale-[0.98] transition text-left"
       },
@@ -2215,7 +2929,7 @@ const App = () => {
       ),
 
       // HEALTH SCORE PANEL
-      (() => {
+      isVisible("health_score") && (() => {
         const sleepData = buildSleepData(data.sleepHistory, data.sleepHours);
         const exerciseProgress = buildExerciseProgress(data.workoutHistory, data.workouts);
         const score = calculateHealthScore(data, sleepData, exerciseProgress);
@@ -2373,7 +3087,7 @@ const App = () => {
       ),
 
       // PROTEIN PANEL
-      e('div', { className: "rounded-2xl bg-zinc-900/80 border border-white/5 p-4 mb-4" },
+      isVisible("protein") && e('div', { className: "rounded-2xl bg-zinc-900/80 border border-white/5 p-4 mb-4" },
         e('div', { className: "flex justify-between items-center mb-2" },
           e('div', { className: "flex items-center gap-2" },
             e('span', { className: "text-base" }, "🥩"),
@@ -2415,7 +3129,7 @@ const App = () => {
       ),
 
       // ENERGY BALANCE PANEL
-      e('div', { className: "rounded-3xl bg-zinc-900/80 border border-white/5 p-5 mb-4" },
+      isVisible("energy_balance") && e('div', { className: "rounded-3xl bg-zinc-900/80 border border-white/5 p-5 mb-4" },
         e('div', { className: "flex justify-between items-start mb-4" },
           e('div', null,
             e('p', { className: "text-zinc-400 text-[10px] font-mono-d uppercase tracking-widest mb-1" }, "Energy balance"),
@@ -2544,7 +3258,7 @@ const App = () => {
       ),
 
       // WORKOUT WEEK PANEL (target days + completion status)
-      (() => {
+      isVisible("schedule") && (() => {
         // Compute Monday-Sunday of current week
         const now = new Date();
         const dayOfWeek = now.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
@@ -2685,7 +3399,7 @@ const App = () => {
       })(),
 
       // AI COACHING PREVIEW (shown if there's coaching available)
-      data.coaching && (() => {
+      isVisible("ai_coaching") && data.coaching && (() => {
         const c = data.coaching;
         const isToday = c.date === new Date().toDateString();
         // Show top 2 tomorrow tips on dashboard (since coaching plans for tomorrow)
@@ -2734,7 +3448,7 @@ const App = () => {
       ),
 
       // SMART TIPS
-      (() => {
+      isVisible("smart_tips") && (() => {
         const tips = generateSmartTips(data, balance, tdee, isOnTrack, isTooAggressive, totalBurned);
         if (tips.length === 0) return null;
         return e('div', { className: "rounded-3xl bg-gradient-to-br from-yellow-500/10 to-orange-500/5 border border-yellow-500/20 p-5 mb-4" },
@@ -2776,7 +3490,7 @@ const App = () => {
       ),
 
       // Stats grid
-      e('div', { className: "grid grid-cols-2 gap-3 mb-4" },
+      isVisible("stats_grid") && e('div', { className: "grid grid-cols-2 gap-3 mb-4" },
         // Steps
         e('button', { 
           onClick: () => setModal('steps'),
@@ -2864,7 +3578,7 @@ const App = () => {
       ),
 
       // Body weight panel
-      e('button', { 
+      isVisible("body_weight") && e('button', { 
         onClick: () => setModal('weight'),
         className: "w-full bg-zinc-900/80 rounded-2xl p-4 mb-4 border border-white/5 active:scale-[0.98] flex items-center gap-3 text-left"
       },
@@ -2885,7 +3599,7 @@ const App = () => {
       ),
 
       // Today's training
-      data.workouts.length > 0 && e('div', { className: "mb-4" },
+      isVisible("todays_training") && data.workouts.length > 0 && e('div', { className: "mb-4" },
         e('h2', { className: "text-white font-display font-semibold mb-3" }, "Today's training"),
         e('div', { className: "space-y-2" },
           data.workouts.map((w) => e('button', { 
@@ -2924,14 +3638,73 @@ const App = () => {
         onChange: (ev) => handleScreenshotImport(ev.target.files),
         style: { display: 'none' }
       })
-    ),
+    );
+    })(),
 
     // ============ FOOD TAB ============
-    activeTab === "food" && e('div', { className: "px-5 pt-4" },
-      e('div', { className: "flex justify-between items-start mb-6" },
+    activeTab === "food" && (() => {
+      // Determine which day's data we're viewing
+      const todayISO = todayLocalISO();
+      const isToday = !foodViewDate || foodViewDate === todayISO;
+      
+      // Get meals for the selected date
+      let viewedMeals = [];
+      let viewedTotalEaten = 0;
+      let viewedTotalProtein = 0;
+      let viewedDayEntry = null;
+      
+      if (isToday) {
+        viewedMeals = data.meals;
+        viewedTotalEaten = totalEaten;
+        viewedTotalProtein = totalProtein;
+      } else {
+        const targetDateStr = fromLocalISO(foodViewDate).toDateString();
+        viewedDayEntry = (data.coachingHistory || []).find(d => d.date === targetDateStr);
+        viewedMeals = viewedDayEntry?.meals || [];
+        viewedTotalEaten = viewedMeals.reduce((s, m) => s + (m.kcal || 0), 0);
+        viewedTotalProtein = viewedMeals.reduce((s, m) => s + (m.protein || 0), 0);
+      }
+      const viewedCalProgress = (viewedTotalEaten / data.caloriesGoal) * 100;
+      
+      // Build last 7 day chips
+      const dayChips = [];
+      for (let i = 0; i < 7; i++) {
+        const d = new Date();
+        d.setDate(d.getDate() - i);
+        const iso = toLocalISO(d);
+        dayChips.push({
+          iso,
+          label: i === 0 ? "Today" : i === 1 ? "Yesterday" : d.toLocaleDateString('en-US', { weekday: 'short' }),
+          dateStr: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+          isSelected: isToday ? i === 0 : iso === foodViewDate,
+        });
+      }
+      
+      // Helper for meal deletion (date-aware)
+      const deleteMealForDate = (mealId) => {
+        if (isToday) {
+          deleteMeal(mealId);
+        } else {
+          const targetDateStr = fromLocalISO(foodViewDate).toDateString();
+          const history = [...(data.coachingHistory || [])];
+          const dayEntry = history.find(d => d.date === targetDateStr);
+          if (dayEntry) {
+            dayEntry.meals = dayEntry.meals.filter(m => m.id !== mealId);
+            dayEntry.totalEaten = dayEntry.meals.reduce((s, mm) => s + (mm.kcal || 0), 0);
+          }
+          updateData({ coachingHistory: history });
+          setSwipedMealId(null);
+        }
+      };
+      
+      return e('div', { className: "px-5 pt-4" },
+      e('div', { className: "flex justify-between items-start mb-4" },
         e('div', null,
           e('p', { className: "text-zinc-500 text-sm font-mono-d uppercase tracking-wider" }, "Nutrition"),
-          e('h1', { className: "text-white text-3xl font-display font-bold" }, "Today's meals")
+          e('h1', { className: "text-white text-3xl font-display font-bold" }, 
+            isToday ? "Today's meals" : 
+            new Date(fromLocalISO(foodViewDate)).toLocaleDateString('en-US', { weekday: 'long' })
+          )
         ),
         e('div', { className: "flex gap-2" },
           e('button', { 
@@ -2945,19 +3718,48 @@ const App = () => {
         )
       ),
 
+      // DATE SELECTOR (last 7 days as chips)
+      e('div', { className: `rounded-2xl p-3 mb-4 border ${!isToday ? 'bg-purple-500/10 border-purple-500/30' : 'bg-zinc-900/60 border-white/5'}` },
+        e('div', { className: "flex justify-between items-center mb-2" },
+          e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase flex items-center gap-1" },
+            e(Icon, { d: icons.clock, size: 10 }),
+            "Viewing date"
+          ),
+          !isToday && e('span', { className: "text-[9px] bg-purple-500/30 text-purple-300 px-1.5 py-0.5 rounded font-mono-d uppercase" }, "backdating")
+        ),
+        e('div', { className: "flex gap-1.5 overflow-x-auto scrollbar-hide" },
+          dayChips.map(d => 
+            e('button', {
+              key: d.iso,
+              onClick: () => setFoodViewDate(d.iso === todayISO ? null : d.iso),
+              className: `flex-shrink-0 rounded-lg px-3 py-1.5 text-[10px] font-mono-d uppercase ${d.isSelected ? 'bg-emerald-400 text-black' : 'bg-zinc-800 text-zinc-400'}`
+            }, d.label)
+          )
+        ),
+        !isToday && e('p', { className: "text-purple-200/80 text-[10px] font-mono-d mt-2" }, 
+          "Adding meals will be saved to this date"
+        )
+      ),
+
+      // Calories card for selected day
       e('div', { className: "bg-gradient-to-br from-cyan-500/20 to-emerald-500/10 rounded-3xl p-5 mb-5 border border-white/5" },
         e('div', { className: "flex justify-between items-center mb-2" },
-          e('span', { className: "text-zinc-400 text-xs font-mono-d uppercase" }, "Eaten today"),
-          e('span', { className: "text-zinc-400 text-xs font-mono-d" }, `${Math.round(calProgress)}%`)
+          e('span', { className: "text-zinc-400 text-xs font-mono-d uppercase" }, 
+            isToday ? "Eaten today" : "Eaten that day"
+          ),
+          e('span', { className: "text-zinc-400 text-xs font-mono-d" }, `${Math.round(viewedCalProgress)}%`)
         ),
         e('div', { className: "flex items-baseline gap-2 mb-3" },
-          e('span', { className: "text-white text-4xl font-display font-bold" }, totalEaten),
+          e('span', { className: "text-white text-4xl font-display font-bold" }, viewedTotalEaten),
           e('span', { className: "text-zinc-500" }, `/ ${data.caloriesGoal} kcal`)
+        ),
+        e('div', { className: "flex gap-3 text-[10px] font-mono-d mb-2" },
+          e('span', { className: "text-emerald-400" }, `${Math.round(viewedTotalProtein)}g protein`)
         ),
         e('div', { className: "h-2 bg-black/40 rounded-full overflow-hidden" },
           e('div', { 
-            className: `h-full ${calProgress > 100 ? 'bg-gradient-to-r from-orange-400 to-rose-400' : 'bg-gradient-to-r from-cyan-400 to-emerald-400'}`,
-            style: { width: `${Math.min(calProgress, 100)}%` }
+            className: `h-full ${viewedCalProgress > 100 ? 'bg-gradient-to-r from-orange-400 to-rose-400' : 'bg-gradient-to-r from-cyan-400 to-emerald-400'}`,
+            style: { width: `${Math.min(viewedCalProgress, 100)}%` }
           })
         )
       ),
@@ -2968,35 +3770,51 @@ const App = () => {
             e(Icon, { d: icons.star, size: 14, className: "text-yellow-400", fill: "currentColor" }),
             "Your favorites"
           ),
-          e('span', { className: "text-[10px] text-zinc-500 font-mono-d" }, "TAP TO ADD")
+          e('span', { className: "text-[10px] text-zinc-500 font-mono-d" }, "TAP · HOLD TO EDIT")
         ),
         e('div', { className: "flex gap-2 overflow-x-auto scrollbar-hide -mx-5 px-5 pb-2" },
-          data.savedMeals.map(m => e('button', { 
+          data.savedMeals.map(m => e(FavoriteMealChip, {
             key: m.id,
-            onClick: () => {
+            meal: m,
+            onTap: () => {
               const t = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-              updateData({ meals: [...data.meals, { ...m, id: Date.now(), time: t, saved: true }] });
+              const newMeal = { ...m, id: Date.now(), time: t, saved: true };
+              if (isToday) {
+                updateData({ meals: [...data.meals, newMeal] });
+              } else {
+                const targetDateStr = fromLocalISO(foodViewDate).toDateString();
+                const history = [...(data.coachingHistory || [])];
+                let dayEntry = history.find(d => d.date === targetDateStr);
+                if (!dayEntry) {
+                  dayEntry = { 
+                    date: targetDateStr, meals: [], workouts: [],
+                    water: 0, steps: 0, sleepHours: null,
+                    totalEaten: 0, totalBurned: 0,
+                  };
+                  history.push(dayEntry);
+                }
+                dayEntry.meals = [...(dayEntry.meals || []), newMeal];
+                dayEntry.totalEaten = dayEntry.meals.reduce((s, mm) => s + (mm.kcal || 0), 0);
+                updateData({ coachingHistory: history.slice(-30) });
+              }
             },
-            className: "flex-shrink-0 w-32 bg-zinc-900/80 rounded-2xl p-3 border border-white/5 active:scale-95 text-left"
-          },
-            e('div', { className: "text-2xl mb-1" }, m.emoji),
-            e('p', { className: "text-white text-xs font-display font-semibold leading-tight line-clamp-2" }, m.name),
-            e('div', { className: "flex justify-between items-end mt-2" },
-              e('span', { className: "text-emerald-400 text-xs font-display font-bold" }, m.kcal),
-              e('span', { className: "text-zinc-600 text-[9px] font-mono-d uppercase" }, m.tag)
-            )
-          ))
+            onLongPress: () => setEditingFavorite(m),
+          }))
         )
       ),
 
       e('div', { className: "flex justify-between items-center mb-2" },
-        e('h3', { className: "text-white font-display font-semibold text-sm" }, "Logged today"),
-        data.meals.length > 0 && e('span', { className: "text-[10px] text-zinc-500 font-mono-d" }, "SWIPE LEFT TO DELETE")
+        e('h3', { className: "text-white font-display font-semibold text-sm" }, 
+          isToday ? "Logged today" : `Logged on ${new Date(fromLocalISO(foodViewDate)).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}`
+        ),
+        viewedMeals.length > 0 && e('span', { className: "text-[10px] text-zinc-500 font-mono-d" }, "SWIPE LEFT TO DELETE")
       ),
-      data.meals.length === 0 ? 
-        e('p', { className: "text-zinc-600 text-sm text-center py-8 font-mono-d" }, "No meals logged yet today") :
+      viewedMeals.length === 0 ? 
+        e('p', { className: "text-zinc-600 text-sm text-center py-8 font-mono-d" }, 
+          isToday ? "No meals logged yet today" : "No meals logged on this day"
+        ) :
         e('div', { className: "space-y-2" },
-          data.meals.map((m) => e('div', { 
+          viewedMeals.map((m) => e('div', { 
             key: m.id,
             className: "relative overflow-hidden rounded-2xl",
             onTouchStart: (ev) => touchStartX.current = ev.touches[0].clientX,
@@ -3008,7 +3826,7 @@ const App = () => {
           },
             e('div', { className: "absolute inset-y-0 right-0 w-24 bg-gradient-to-r from-rose-600 to-rose-500 flex items-center justify-center" },
               e('button', { 
-                onClick: () => deleteMeal(m.id),
+                onClick: () => deleteMealForDate(m.id),
                 className: "text-white flex flex-col items-center gap-1"
               },
                 e(Icon, { d: icons.trash, size: 20 }),
@@ -3018,7 +3836,8 @@ const App = () => {
             e('button', { 
               onClick: () => {
                 if (swipedMealId === m.id) setSwipedMealId(null);
-                else setEditingMeal(m);
+                else if (isToday) setEditingMeal(m);
+                // Don't allow editing of backdated meals for now (more complex)
               },
               className: `relative bg-zinc-900 rounded-2xl p-3.5 flex items-center gap-3 border border-white/5 transition-transform duration-200 w-full text-left ${swipedMealId === m.id ? '-translate-x-24' : 'translate-x-0'}`
             },
@@ -3037,7 +3856,8 @@ const App = () => {
             )
           ))
         )
-    ),
+      );
+    })(),
 
     // ============ TRAINING TAB ============
     activeTab === "training" && e('div', { className: "px-5 pt-4" },
@@ -3670,41 +4490,19 @@ const App = () => {
     // ============ MODALS ============
     
     // Water modal
-    modal === 'water' && e(Modal, { onClose: () => setModal(null), title: "Log water" },
-      e('p', { className: "text-zinc-500 text-sm mb-5" }, 
-        `Currently ${(data.water * 0.25).toFixed(2)}L of ${(data.waterGoal * 0.25).toFixed(2)}L`
-      ),
-      e('div', { className: "grid grid-cols-2 gap-3 mb-3" },
-        e(WaterButton, { ml: 300, onClick: () => addWater(300), emoji: "🥛", label: "Glass" }),
-        e(WaterButton, { ml: 500, onClick: () => addWater(500), emoji: "🍶", label: "Bottle" })
-      ),
-      e('div', { className: "grid grid-cols-2 gap-3 mb-4" },
-        e('button', { 
-          onClick: () => addWater(750),
-          className: "bg-zinc-800 rounded-2xl p-4 active:scale-95"
-        },
-          e('p', { className: "text-white font-display font-semibold text-sm" }, "Large bottle"),
-          e('p', { className: "text-zinc-400 text-xs font-mono-d" }, "750 ml")
-        ),
-        e('button', { 
-          onClick: () => addWater(150),
-          className: "bg-zinc-800 rounded-2xl p-4 active:scale-95"
-        },
-          e('p', { className: "text-white font-display font-semibold text-sm" }, "Small cup"),
-          e('p', { className: "text-zinc-400 text-xs font-mono-d" }, "150 ml")
-        )
-      ),
-      e('button', { 
-        onClick: () => setModal(null),
-        className: "w-full bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
-      }, "Cancel")
-    ),
+    modal === 'water' && e(WaterModal, {
+      data,
+      onClose: () => setModal(null),
+      onSave: (newWater, forDate) => {
+        setMetricForDate('water', newWater, forDate);
+      }
+    }),
     
     // Steps modal
     modal === 'steps' && e(StepsModal, { 
       data, 
       onClose: () => setModal(null), 
-      onSave: (s) => { updateData({ steps: s }); setModal(null); }
+      onSave: (s, forDate) => { setMetricForDate('steps', s, forDate); setModal(null); }
     }),
     
     // Sleep modal
@@ -3719,8 +4517,10 @@ const App = () => {
       iconClass: "text-indigo-400",
       presets: [5, 6, 7, 7.5, 8, 9],
       presetSuffix: "h",
+      allowBackdate: true,
+      getValueForDate: (forDate) => getMetricForDate('sleepHours', forDate),
       onClose: () => setModal(null),
-      onSave: (v) => { updateData({ sleepHours: v }); setModal(null); }
+      onSave: (v, forDate) => { setMetricForDate('sleepHours', v, forDate); setModal(null); }
     }),
     
     // Heart rate modal
@@ -3735,8 +4535,10 @@ const App = () => {
       iconClass: "text-rose-400",
       presets: [55, 60, 65, 70, 75, 80],
       presetSuffix: "",
+      allowBackdate: true,
+      getValueForDate: (forDate) => getMetricForDate('restingHR', forDate),
       onClose: () => setModal(null),
-      onSave: (v) => { updateData({ restingHR: Math.round(v) }); setModal(null); }
+      onSave: (v, forDate) => { setMetricForDate('restingHR', Math.round(v), forDate); setModal(null); }
     }),
     
     // Goal modal
@@ -3784,6 +4586,17 @@ const App = () => {
       data,
       onClose: () => setModal(null),
       onImported: () => { window.location.reload(); }
+    }),
+    
+    // Customize dashboard modal
+    modal === 'customize' && e(CustomizeDashboardModal, {
+      data,
+      onClose: () => setModal(null),
+      onMoveUp: movePanelUp,
+      onMoveDown: movePanelDown,
+      onHide: hidePanel,
+      onShow: showPanel,
+      onReset: resetPanelOrder,
     }),
     
     // Training settings modal
@@ -3835,7 +4648,27 @@ const App = () => {
             e('button', {
               onClick: () => {
                 const t = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-                updateData({ meals: [...data.meals, { ...m, id: Date.now(), time: t, saved: true }] });
+                const newMeal = { ...m, id: Date.now(), time: t, saved: true };
+                
+                if (foodViewDate) {
+                  // Backdating: add to that day's archive
+                  const targetDateStr = fromLocalISO(foodViewDate).toDateString();
+                  const history = [...(data.coachingHistory || [])];
+                  let dayEntry = history.find(d => d.date === targetDateStr);
+                  if (!dayEntry) {
+                    dayEntry = { 
+                      date: targetDateStr, meals: [], workouts: [], 
+                      water: 0, steps: 0, sleepHours: null,
+                      totalEaten: 0, totalBurned: 0,
+                    };
+                    history.push(dayEntry);
+                  }
+                  dayEntry.meals = [...(dayEntry.meals || []), newMeal];
+                  dayEntry.totalEaten = dayEntry.meals.reduce((s, mm) => s + (mm.kcal || 0), 0);
+                  updateData({ coachingHistory: history.slice(-30) });
+                } else {
+                  updateData({ meals: [...data.meals, newMeal] });
+                }
                 setModal(null);
               },
               className: "flex-1 flex items-center gap-3 p-3.5 active:scale-[0.98] text-left"
@@ -3873,10 +4706,38 @@ const App = () => {
       onSave: (meal, saveAsTemplate) => {
         const t = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
         const newMeal = { ...meal, id: Date.now(), time: t };
-        const updates = { meals: [...data.meals, newMeal] };
+        let updates = {};
+        
+        if (foodViewDate) {
+          // Backdating: add this meal to that day's archived snapshot in coachingHistory
+          const targetDateStr = fromLocalISO(foodViewDate).toDateString();
+          const history = [...(data.coachingHistory || [])];
+          let dayEntry = history.find(d => d.date === targetDateStr);
+          if (!dayEntry) {
+            // Create a new history entry for that day
+            dayEntry = { 
+              date: targetDateStr, 
+              meals: [], 
+              workouts: [], 
+              water: 0, 
+              steps: 0, 
+              sleepHours: null,
+              totalEaten: 0,
+              totalBurned: 0,
+            };
+            history.push(dayEntry);
+          }
+          dayEntry.meals = [...(dayEntry.meals || []), newMeal];
+          dayEntry.totalEaten = dayEntry.meals.reduce((s, m) => s + (m.kcal || 0), 0);
+          updates.coachingHistory = history.slice(-30); // keep more history for backdating
+        } else {
+          // Normal: add to today
+          updates.meals = [...data.meals, newMeal];
+        }
+        
         if (saveAsTemplate) {
           updates.savedMeals = [...data.savedMeals, { 
-            ...meal, id: Date.now() + 1, tag: "custom", protein: 0, carbs: 0, fats: 0 
+            ...meal, id: Date.now() + 1, tag: "custom", carbs: 0, fats: 0 
           }];
         }
         updateData(updates);
@@ -3897,6 +4758,24 @@ const App = () => {
       onDelete: () => {
         deleteMeal(editingMeal.id);
         setEditingMeal(null);
+      }
+    }),
+    
+    // Edit favorite (template) meal modal
+    editingFavorite && e(EditMealModal, {
+      meal: editingFavorite,
+      onClose: () => setEditingFavorite(null),
+      onSave: (updated) => {
+        updateData({ 
+          savedMeals: data.savedMeals.map(m => m.id === updated.id ? updated : m)
+        });
+        setEditingFavorite(null);
+      },
+      onDelete: () => {
+        if (confirm(`Delete "${editingFavorite.name}" from favorites?`)) {
+          updateData({ savedMeals: data.savedMeals.filter(m => m.id !== editingFavorite.id) });
+          setEditingFavorite(null);
+        }
       }
     }),
     
@@ -3997,6 +4876,90 @@ const App = () => {
 };
 
 // ============ MODAL COMPONENTS ============
+// Reusable: 7-day chip selector for backdating logs (steps/water/sleep/HR/etc)
+// selectedDate is "YYYY-MM-DD" or null (= today)
+const DateChips = ({ selectedDate, onChange }) => {
+  const todayISO = todayLocalISO();
+  const isToday = !selectedDate || selectedDate === todayISO;
+  
+  const chips = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const iso = toLocalISO(d);
+    chips.push({
+      iso,
+      label: i === 0 ? "Today" : i === 1 ? "Yesterday" : d.toLocaleDateString('en-US', { weekday: 'short' }),
+      dateStr: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      isSelected: isToday ? i === 0 : iso === selectedDate,
+    });
+  }
+  
+  return e('div', { className: `rounded-xl p-2.5 mb-4 border ${!isToday ? 'bg-purple-500/10 border-purple-500/30' : 'bg-zinc-800/60 border-white/5'}` },
+    e('div', { className: "flex justify-between items-center mb-1.5 px-1" },
+      e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "For which day?"),
+      !isToday && e('span', { className: "text-[9px] bg-purple-500/30 text-purple-300 px-1.5 py-0.5 rounded font-mono-d uppercase" }, "backdating")
+    ),
+    e('div', { className: "flex gap-1 overflow-x-auto scrollbar-hide" },
+      chips.map(d => 
+        e('button', {
+          key: d.iso,
+          onClick: () => onChange(d.iso === todayISO ? null : d.iso),
+          className: `flex-shrink-0 rounded-md px-2.5 py-1 text-[10px] font-mono-d uppercase ${d.isSelected ? 'bg-emerald-400 text-black' : 'bg-zinc-900 text-zinc-400'}`
+        }, d.label)
+      )
+    )
+  );
+};
+
+// Favorite meal chip with tap-to-add and long-press-to-edit
+const FavoriteMealChip = ({ meal, onTap, onLongPress }) => {
+  const pressTimerRef = uR(null);
+  const longPressFiredRef = uR(false);
+  
+  const startPress = (ev) => {
+    longPressFiredRef.current = false;
+    pressTimerRef.current = setTimeout(() => {
+      longPressFiredRef.current = true;
+      if (navigator.vibrate) navigator.vibrate(50);
+      onLongPress();
+    }, 500);
+  };
+  
+  const cancelPress = () => {
+    if (pressTimerRef.current) {
+      clearTimeout(pressTimerRef.current);
+      pressTimerRef.current = null;
+    }
+  };
+  
+  const handleClick = () => {
+    if (longPressFiredRef.current) return; // suppress click after long-press
+    onTap();
+  };
+  
+  return e('button', { 
+    onClick: handleClick,
+    onTouchStart: startPress,
+    onTouchEnd: cancelPress,
+    onTouchCancel: cancelPress,
+    onTouchMove: cancelPress,
+    onMouseDown: startPress,
+    onMouseUp: cancelPress,
+    onMouseLeave: cancelPress,
+    className: "flex-shrink-0 w-32 bg-zinc-900/80 rounded-2xl p-3 border border-white/5 active:scale-95 text-left"
+  },
+    e('div', { className: "text-2xl mb-1" }, meal.emoji),
+    e('p', { className: "text-white text-xs font-display font-semibold leading-tight line-clamp-2" }, meal.name),
+    e('div', { className: "flex justify-between items-end mt-2" },
+      e('span', { className: "text-emerald-400 text-xs font-display font-bold" }, meal.kcal),
+      e('span', { className: "text-zinc-600 text-[9px] font-mono-d uppercase" }, 
+        meal.protein ? `${Math.round(meal.protein)}P` : meal.tag
+      )
+    )
+  );
+};
+
 const Modal = ({ onClose, title, subtitle, children }) => 
   e('div', { 
     className: "fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-end",
@@ -4024,13 +4987,26 @@ const WaterButton = ({ ml, onClick, emoji, label }) =>
   );
 
 // Reusable simple entry modal for things like sleep, heart rate
-const SimpleEntryModal = ({ title, subtitle, currentValue, unit, placeholder, step = "1", icon, iconClass, presets = [], presetSuffix = "", onClose, onSave }) => {
+const SimpleEntryModal = ({ title, subtitle, currentValue, unit, placeholder, step = "1", icon, iconClass, presets = [], presetSuffix = "", onClose, onSave, allowBackdate = false, getValueForDate = null }) => {
   const [val, setVal] = uS(currentValue !== null && currentValue !== undefined ? String(currentValue) : "");
+  const [forDate, setForDate] = uS(null); // null = today
+  
+  // When backdating, fetch that day's existing value
+  uE(() => {
+    if (forDate && getValueForDate) {
+      const v = getValueForDate(forDate);
+      setVal(v !== null && v !== undefined ? String(v) : "");
+    } else if (!forDate) {
+      setVal(currentValue !== null && currentValue !== undefined ? String(currentValue) : "");
+    }
+  }, [forDate]);
   
   return e(Modal, { onClose, title },
-    e('p', { className: "text-zinc-500 text-sm mb-5" }, subtitle),
+    e('p', { className: "text-zinc-500 text-sm mb-4" }, subtitle),
     
-    currentValue !== null && currentValue !== undefined && e('div', { className: "bg-zinc-800 rounded-2xl p-4 mb-4 flex items-center gap-3" },
+    allowBackdate && e(DateChips, { selectedDate: forDate, onChange: setForDate }),
+    
+    currentValue !== null && currentValue !== undefined && !forDate && e('div', { className: "bg-zinc-800 rounded-2xl p-4 mb-4 flex items-center gap-3" },
       e(Icon, { d: icon, size: 20, className: iconClass }),
       e('div', null,
         e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-1" }, "Currently logged"),
@@ -4068,24 +5044,92 @@ const SimpleEntryModal = ({ title, subtitle, currentValue, unit, placeholder, st
       e('button', { 
         onClick: () => {
           const v = parseFloat(val);
-          if (!isNaN(v) && v > 0) onSave(v);
+          if (!isNaN(v) && v > 0) onSave(v, forDate);
         },
         className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
       },
         e(Icon, { d: icons.check, size: 18, stroke: "black" }),
-        "Save"
+        forDate ? "Save to " + new Date(fromLocalISO(forDate)).toLocaleDateString('en-US', { weekday: 'short' }) : "Save"
       )
     )
   );
 };
 
+const WaterModal = ({ data, onClose, onSave }) => {
+  const [forDate, setForDate] = uS(null);
+  
+  // Get current water for the selected date
+  const getCurrentWater = () => {
+    if (!forDate) return data.water;
+    const targetDateStr = fromLocalISO(forDate).toDateString();
+    const dayEntry = (data.coachingHistory || []).find(d => d.date === targetDateStr);
+    return dayEntry?.water || 0;
+  };
+  const currentWater = getCurrentWater();
+  
+  const addWater = (ml) => {
+    const glasses = ml / 250;
+    const newTotal = Math.min(currentWater + glasses, 30);
+    onSave(newTotal, forDate);
+  };
+  
+  return e(Modal, { onClose, title: "Log water" },
+    e('p', { className: "text-zinc-500 text-sm mb-4" }, 
+      `${forDate ? "That day:" : "Currently"} ${(currentWater * 0.25).toFixed(2)}L of ${(data.waterGoal * 0.25).toFixed(2)}L`
+    ),
+    e(DateChips, { selectedDate: forDate, onChange: setForDate }),
+    e('div', { className: "grid grid-cols-2 gap-3 mb-3" },
+      e(WaterButton, { ml: 300, onClick: () => addWater(300), emoji: "🥛", label: "Glass" }),
+      e(WaterButton, { ml: 500, onClick: () => addWater(500), emoji: "🍶", label: "Bottle" })
+    ),
+    e('div', { className: "grid grid-cols-2 gap-3 mb-4" },
+      e('button', { 
+        onClick: () => addWater(750),
+        className: "bg-zinc-800 rounded-2xl p-4 active:scale-95"
+      },
+        e('p', { className: "text-white font-display font-semibold text-sm" }, "Large bottle"),
+        e('p', { className: "text-zinc-400 text-xs font-mono-d" }, "750 ml")
+      ),
+      e('button', { 
+        onClick: () => addWater(150),
+        className: "bg-zinc-800 rounded-2xl p-4 active:scale-95"
+      },
+        e('p', { className: "text-white font-display font-semibold text-sm" }, "Small cup"),
+        e('p', { className: "text-zinc-400 text-xs font-mono-d" }, "150 ml")
+      )
+    ),
+    currentWater > 0 && e('button', {
+      onClick: () => onSave(0, forDate),
+      className: "w-full bg-rose-500/20 text-rose-300 rounded-xl py-2.5 text-xs font-display font-semibold mb-2"
+    }, "↻ Reset to 0"),
+    e('button', { 
+      onClick: onClose,
+      className: "w-full bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
+    }, "Done")
+  );
+};
+
 const StepsModal = ({ data, onClose, onSave }) => {
   const [val, setVal] = uS(String(data.steps));
+  const [forDate, setForDate] = uS(null);
+  
+  // Show that day's existing value when backdating
+  uE(() => {
+    if (forDate) {
+      const targetDateStr = fromLocalISO(forDate).toDateString();
+      const dayEntry = (data.coachingHistory || []).find(d => d.date === targetDateStr);
+      setVal(String(dayEntry?.steps || 0));
+    } else {
+      setVal(String(data.steps));
+    }
+  }, [forDate]);
+  
   return e(Modal, { onClose, title: "Update steps" },
-    e('p', { className: "text-zinc-500 text-sm mb-5" }, 
-      "Manually log your total steps for today."
+    e('p', { className: "text-zinc-500 text-sm mb-4" }, 
+      "Manually log your total steps."
     ),
-    e('div', { className: "bg-zinc-800 rounded-2xl p-4 mb-4" },
+    e(DateChips, { selectedDate: forDate, onChange: setForDate }),
+    !forDate && e('div', { className: "bg-zinc-800 rounded-2xl p-4 mb-4" },
       e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-1" }, "Currently logged"),
       e('p', { className: "text-white text-3xl font-display font-bold" }, data.steps.toLocaleString()),
       e('p', { className: "text-zinc-500 text-xs font-mono-d" }, `of ${data.stepsGoal.toLocaleString()} goal`)
@@ -4103,11 +5147,11 @@ const StepsModal = ({ data, onClose, onSave }) => {
         className: "flex-1 bg-zinc-800 text-white rounded-xl py-3 font-display font-semibold"
       }, "Cancel"),
       e('button', { 
-        onClick: () => onSave(parseInt(val) || 0),
+        onClick: () => onSave(parseInt(val) || 0, forDate),
         className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold flex items-center justify-center gap-2"
       },
         e(Icon, { d: icons.check, size: 18, stroke: "black" }),
-        "Save"
+        forDate ? "Save to " + new Date(fromLocalISO(forDate)).toLocaleDateString('en-US', { weekday: 'short' }) : "Save"
       )
     )
   );
@@ -4514,6 +5558,107 @@ const TrainingSettingsModal = ({ data, onClose, onSave }) => {
         "Save"
       )
     )
+  );
+};
+
+const CustomizeDashboardModal = ({ data, onClose, onMoveUp, onMoveDown, onHide, onShow, onReset }) => {
+  const PANEL_LABELS = {
+    mission: { name: "Mission status", emoji: "🎯", desc: "Today's targets at a glance" },
+    momentum: { name: "Momentum", emoji: "🔥", desc: "Consistency tracker (last 14 days)" },
+    recovery: { name: "Recovery readiness", emoji: "🔋", desc: "Train hard / easy / rest" },
+    weight_goal: { name: "Weight goal", emoji: "⚖️", desc: "Distance to target weight" },
+    health_score: { name: "Health score", emoji: "💯", desc: "0-100 across 5 dimensions" },
+    protein: { name: "Protein tracker", emoji: "🥩", desc: "Daily protein with macro split" },
+    energy_balance: { name: "Energy balance", emoji: "⚡", desc: "Calorie deficit/surplus" },
+    schedule: { name: "Weekly schedule", emoji: "📅", desc: "Training days this week" },
+    ai_coaching: { name: "AI coach preview", emoji: "✨", desc: "Latest coaching tips" },
+    smart_tips: { name: "Quick tips", emoji: "💡", desc: "Rule-based reminders" },
+    forecast: { name: "Weight forecast", emoji: "🔮", desc: "Projected weight in 14/28 days" },
+    stats_grid: { name: "Stats grid", emoji: "📊", desc: "Steps, water, sleep, HR" },
+    body_weight: { name: "Body weight", emoji: "⚖️", desc: "Current weight, tap to log" },
+    todays_training: { name: "Today's training", emoji: "💪", desc: "Logged workouts today" },
+  };
+  
+  const visible = data.panelOrder || [];
+  const allIds = Object.keys(PANEL_LABELS);
+  const hidden = allIds.filter(id => !visible.includes(id));
+  
+  return e(Modal, { onClose, title: "Customize dashboard", subtitle: "Reorder, hide, or restore panels" },
+    // Visible panels
+    e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, 
+      `Visible · ${visible.length} panel${visible.length !== 1 ? 's' : ''}`
+    ),
+    e('div', { className: "space-y-2 mb-5" },
+      visible.map((id, idx) => {
+        const meta = PANEL_LABELS[id];
+        if (!meta) return null;
+        const isFirst = idx === 0;
+        const isLast = idx === visible.length - 1;
+        return e('div', { key: id, className: "bg-zinc-800 rounded-xl p-3 flex items-center gap-2" },
+          e('span', { className: "text-xl" }, meta.emoji),
+          e('div', { className: "flex-1 min-w-0" },
+            e('p', { className: "text-white font-display font-semibold text-sm truncate" }, meta.name),
+            e('p', { className: "text-zinc-500 text-[10px] truncate" }, meta.desc)
+          ),
+          e('div', { className: "flex gap-1" },
+            e('button', {
+              onClick: () => onMoveUp(id),
+              disabled: isFirst,
+              className: `w-8 h-8 rounded-lg flex items-center justify-center ${isFirst ? 'bg-zinc-900 text-zinc-700' : 'bg-zinc-700 text-emerald-400 active:scale-90'}`
+            }, e('span', { className: "text-base" }, "↑")),
+            e('button', {
+              onClick: () => onMoveDown(id),
+              disabled: isLast,
+              className: `w-8 h-8 rounded-lg flex items-center justify-center ${isLast ? 'bg-zinc-900 text-zinc-700' : 'bg-zinc-700 text-emerald-400 active:scale-90'}`
+            }, e('span', { className: "text-base" }, "↓")),
+            e('button', {
+              onClick: () => {
+                if (confirm(`Hide "${meta.name}" from dashboard?`)) onHide(id);
+              },
+              className: "w-8 h-8 rounded-lg bg-rose-500/20 text-rose-400 flex items-center justify-center active:scale-90"
+            }, e('span', { className: "text-sm" }, "×"))
+          )
+        );
+      })
+    ),
+    
+    // Hidden panels (can be restored)
+    hidden.length > 0 && e(React.Fragment, null,
+      e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, 
+        `Hidden · ${hidden.length}`
+      ),
+      e('div', { className: "space-y-2 mb-5" },
+        hidden.map(id => {
+          const meta = PANEL_LABELS[id];
+          if (!meta) return null;
+          return e('div', { key: id, className: "bg-zinc-900 border border-white/5 rounded-xl p-3 flex items-center gap-2 opacity-70" },
+            e('span', { className: "text-xl" }, meta.emoji),
+            e('div', { className: "flex-1 min-w-0" },
+              e('p', { className: "text-zinc-400 font-display font-semibold text-sm truncate" }, meta.name),
+              e('p', { className: "text-zinc-600 text-[10px] truncate" }, meta.desc)
+            ),
+            e('button', {
+              onClick: () => onShow(id),
+              className: "bg-emerald-500/20 text-emerald-300 rounded-lg px-2.5 py-1.5 text-[10px] font-mono-d uppercase active:scale-90"
+            }, "+ show")
+          );
+        })
+      )
+    ),
+    
+    e('button', {
+      onClick: () => {
+        if (confirm("Reset to default order? This will show all panels.")) {
+          onReset();
+        }
+      },
+      className: "w-full bg-zinc-800 text-zinc-400 rounded-xl py-2.5 text-xs font-display font-semibold mb-3"
+    }, "↻ Reset to default order"),
+    
+    e('button', { 
+      onClick: onClose,
+      className: "w-full bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold"
+    }, "Done")
   );
 };
 
@@ -5000,15 +6145,21 @@ const AddMealModal = ({ onClose, onSave }) => {
   const [emoji, setEmoji] = uS("🍽️");
   const [ingredients, setIngredients] = uS([{ name: "", amount: "", unit: "g" }]);
   const [overrideKcal, setOverrideKcal] = uS("");
+  const [overrideProtein, setOverrideProtein] = uS("");
   const [saveAsTemplate, setSaveAsTemplate] = uS(false);
   
   // Calculate total kcal from ingredients
   const ingredientKcals = ingredients.map(ing => 
     estimateIngredientKcal(ing.name, ing.amount, ing.unit)
   );
+  const ingredientProteins = ingredients.map(ing => 
+    estimateIngredientProtein(ing.name, ing.amount, ing.unit)
+  );
   const hasUnknown = ingredientKcals.some(k => k === null);
   const estimatedTotal = ingredientKcals.reduce((sum, k) => sum + (k || 0), 0);
+  const estimatedProtein = ingredientProteins.reduce((sum, p) => sum + (p || 0), 0);
   const finalKcal = overrideKcal !== "" ? parseInt(overrideKcal) || 0 : estimatedTotal;
+  const finalProtein = overrideProtein !== "" ? parseFloat(overrideProtein) || 0 : estimatedProtein;
   
   const updateIngredient = (idx, field, value) => {
     const updated = [...ingredients];
@@ -5106,30 +6257,53 @@ const AddMealModal = ({ onClose, onSave }) => {
       ))
     ),
     
-    // Estimated total + override
-    e('div', { className: `rounded-xl p-3 mb-4 border ${overrideKcal !== "" ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-zinc-800 border-white/5'}` },
-      e('div', { className: "flex justify-between items-center mb-2" },
-        e('p', { className: "text-[10px] text-zinc-400 font-mono-d uppercase" }, 
-          overrideKcal !== "" ? "Manual override" : "Estimated total"
+    // Estimated total + override (kcal AND protein)
+    e('div', { className: "grid grid-cols-2 gap-2 mb-4" },
+      // KCAL
+      e('div', { className: `rounded-xl p-3 border ${overrideKcal !== "" ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-zinc-800 border-white/5'}` },
+        e('div', { className: "flex justify-between items-center mb-1" },
+          e('p', { className: "text-[10px] text-zinc-400 font-mono-d uppercase" }, 
+            overrideKcal !== "" ? "Manual" : "Auto"
+          ),
+          overrideKcal !== "" && e('button', { 
+            onClick: () => setOverrideKcal(""),
+            className: "text-zinc-500 text-[9px] font-mono-d uppercase active:scale-95"
+          }, "↻")
         ),
-        hasUnknown && overrideKcal === "" && e('span', { className: "text-[9px] text-orange-400 font-mono-d uppercase" }, "Some unknown")
+        e('div', { className: "flex items-baseline gap-1" },
+          e('input', {
+            value: overrideKcal !== "" ? overrideKcal : (estimatedTotal || ""),
+            onChange: (ev) => setOverrideKcal(ev.target.value),
+            type: "number",
+            placeholder: "kcal",
+            className: "min-w-0 flex-1 bg-transparent text-white text-2xl font-display font-bold outline-none"
+          }),
+          e('span', { className: "text-zinc-500 text-xs font-mono-d" }, "kcal")
+        ),
+        hasUnknown && overrideKcal === "" && e('p', { className: "text-[9px] text-orange-400 mt-1" }, "some unknown")
       ),
-      e('div', { className: "flex items-center gap-2" },
-        e('input', {
-          value: overrideKcal !== "" ? overrideKcal : (estimatedTotal || ""),
-          onChange: (ev) => setOverrideKcal(ev.target.value),
-          type: "number",
-          placeholder: "kcal",
-          className: "flex-1 bg-transparent text-white text-2xl font-display font-bold outline-none"
-        }),
-        e('span', { className: "text-zinc-500 text-sm font-mono-d" }, "kcal"),
-        overrideKcal !== "" && e('button', { 
-          onClick: () => setOverrideKcal(""),
-          className: "text-zinc-500 text-[10px] font-mono-d uppercase ml-2 active:scale-95"
-        }, "↻ auto")
-      ),
-      hasUnknown && overrideKcal === "" && e('p', { className: "text-[10px] text-zinc-500 mt-2" }, 
-        "Tap the field above to enter a manual value"
+      // PROTEIN
+      e('div', { className: `rounded-xl p-3 border ${overrideProtein !== "" ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-zinc-800 border-white/5'}` },
+        e('div', { className: "flex justify-between items-center mb-1" },
+          e('p', { className: "text-[10px] text-zinc-400 font-mono-d uppercase" }, 
+            overrideProtein !== "" ? "Manual" : "Auto"
+          ),
+          overrideProtein !== "" && e('button', { 
+            onClick: () => setOverrideProtein(""),
+            className: "text-zinc-500 text-[9px] font-mono-d uppercase active:scale-95"
+          }, "↻")
+        ),
+        e('div', { className: "flex items-baseline gap-1" },
+          e('input', {
+            value: overrideProtein !== "" ? overrideProtein : (estimatedProtein > 0 ? estimatedProtein.toFixed(0) : ""),
+            onChange: (ev) => setOverrideProtein(ev.target.value),
+            type: "number",
+            step: "0.1",
+            placeholder: "g",
+            className: "min-w-0 flex-1 bg-transparent text-emerald-300 text-2xl font-display font-bold outline-none"
+          }),
+          e('span', { className: "text-zinc-500 text-xs font-mono-d" }, "g")
+        )
       )
     ),
     
@@ -5153,14 +6327,10 @@ const AddMealModal = ({ onClose, onSave }) => {
         onClick: () => {
           if (name && finalKcal > 0) {
             const validIngredients = ingredients.filter(i => i.name && i.amount);
-            // Compute total protein from ingredients
-            const totalProtein = validIngredients.reduce((sum, ing) => 
-              sum + (estimateIngredientProtein(ing.name, ing.amount, ing.unit) || 0)
-            , 0);
             onSave({ 
               name, 
               kcal: finalKcal, 
-              protein: Math.round(totalProtein),
+              protein: Math.round(finalProtein * 10) / 10,
               emoji,
               ingredients: validIngredients
             }, saveAsTemplate);
@@ -5177,15 +6347,23 @@ const AddMealModal = ({ onClose, onSave }) => {
 
 const EditMealModal = ({ meal, onClose, onSave, onDelete }) => {
   const [name, setName] = uS(meal.name);
+  const [emoji, setEmoji] = uS(meal.emoji || "🍽️");
   const [ingredients, setIngredients] = uS(meal.ingredients && meal.ingredients.length > 0 ? meal.ingredients : []);
   const [kcal, setKcal] = uS(String(meal.kcal));
+  const [protein, setProtein] = uS(String(meal.protein || 0));
   const [overrideKcal, setOverrideKcal] = uS(false);
+  const [overrideProtein, setOverrideProtein] = uS(false);
   
   const ingredientKcals = ingredients.map(ing => 
     estimateIngredientKcal(ing.name, ing.amount, ing.unit)
   );
+  const ingredientProteins = ingredients.map(ing => 
+    estimateIngredientProtein(ing.name, ing.amount, ing.unit)
+  );
   const estimatedTotal = ingredientKcals.reduce((sum, k) => sum + (k || 0), 0);
+  const estimatedProtein = ingredientProteins.reduce((sum, p) => sum + (p || 0), 0);
   const finalKcal = overrideKcal || ingredients.length === 0 ? parseInt(kcal) || 0 : estimatedTotal;
+  const finalProtein = overrideProtein || ingredients.length === 0 ? parseFloat(protein) || 0 : estimatedProtein;
   
   const updateIngredient = (idx, field, value) => {
     const updated = [...ingredients];
@@ -5195,6 +6373,11 @@ const EditMealModal = ({ meal, onClose, onSave, onDelete }) => {
       const newKcals = updated.map(ing => estimateIngredientKcal(ing.name, ing.amount, ing.unit));
       const newTotal = newKcals.reduce((s, k) => s + (k || 0), 0);
       setKcal(String(newTotal));
+    }
+    if (!overrideProtein) {
+      const newProteins = updated.map(ing => estimateIngredientProtein(ing.name, ing.amount, ing.unit));
+      const newTotal = newProteins.reduce((s, p) => s + (p || 0), 0);
+      setProtein(String(Math.round(newTotal * 10) / 10));
     }
   };
   
@@ -5209,9 +6392,23 @@ const EditMealModal = ({ meal, onClose, onSave, onDelete }) => {
       const newKcals = updated.map(ing => estimateIngredientKcal(ing.name, ing.amount, ing.unit));
       setKcal(String(newKcals.reduce((s, k) => s + (k || 0), 0)));
     }
+    if (!overrideProtein) {
+      const newProteins = updated.map(ing => estimateIngredientProtein(ing.name, ing.amount, ing.unit));
+      setProtein(String(Math.round(newProteins.reduce((s, p) => s + (p || 0), 0) * 10) / 10));
+    }
   };
   
   return e(Modal, { onClose, title: "Edit meal" },
+    // Emoji picker
+    e('div', { className: "flex gap-2 mb-4 overflow-x-auto scrollbar-hide" },
+      ['🥣','🥗','🍕','🍔','🍱','🍝','🥤','🍎','🥑','🍌','🍣','🌮','🍳','🥩','🍖','💪','🥛'].map(em => 
+        e('button', { 
+          key: em,
+          onClick: () => setEmoji(em),
+          className: `flex-shrink-0 w-12 h-12 rounded-xl text-2xl flex items-center justify-center ${emoji === em ? 'bg-emerald-500/30 border-2 border-emerald-400' : 'bg-zinc-800'}`
+        }, em)
+      )
+    ),
     e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, "Name"),
     e('input', { 
       value: name,
@@ -5280,15 +6477,32 @@ const EditMealModal = ({ meal, onClose, onSave, onDelete }) => {
     
     // Total kcal
     e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, "Total calories"),
-    e('div', { className: "bg-zinc-800 rounded-xl p-3 mb-4" },
-      e('div', { className: "flex items-center gap-2" },
-        e('input', { 
-          value: kcal,
-          onChange: (ev) => { setKcal(ev.target.value); setOverrideKcal(true); },
-          type: "number",
-          className: "flex-1 bg-transparent text-white text-2xl font-display font-bold outline-none"
-        }),
-        e('span', { className: "text-zinc-500 text-sm font-mono-d" }, "kcal")
+    // KCAL + PROTEIN
+    e('div', { className: "grid grid-cols-2 gap-2 mb-4" },
+      e('div', { className: "bg-zinc-800 rounded-xl p-3" },
+        e('p', { className: "text-[10px] text-zinc-400 font-mono-d uppercase mb-1" }, "Calories"),
+        e('div', { className: "flex items-baseline gap-1" },
+          e('input', { 
+            value: kcal,
+            onChange: (ev) => { setKcal(ev.target.value); setOverrideKcal(true); },
+            type: "number",
+            className: "min-w-0 flex-1 bg-transparent text-white text-2xl font-display font-bold outline-none"
+          }),
+          e('span', { className: "text-zinc-500 text-xs font-mono-d" }, "kcal")
+        )
+      ),
+      e('div', { className: "bg-zinc-800 rounded-xl p-3" },
+        e('p', { className: "text-[10px] text-zinc-400 font-mono-d uppercase mb-1" }, "Protein"),
+        e('div', { className: "flex items-baseline gap-1" },
+          e('input', { 
+            value: protein,
+            onChange: (ev) => { setProtein(ev.target.value); setOverrideProtein(true); },
+            type: "number",
+            step: "0.1",
+            className: "min-w-0 flex-1 bg-transparent text-emerald-300 text-2xl font-display font-bold outline-none"
+          }),
+          e('span', { className: "text-zinc-500 text-xs font-mono-d" }, "g")
+        )
       )
     ),
     
@@ -5307,7 +6521,9 @@ const EditMealModal = ({ meal, onClose, onSave, onDelete }) => {
         onClick: () => onSave({ 
           ...meal, 
           name, 
+          emoji,
           kcal: parseInt(kcal) || 0,
+          protein: Math.round(finalProtein * 10) / 10,
           ingredients: ingredients.filter(i => i.name && i.amount)
         }),
         className: "flex-1 bg-emerald-400 text-black rounded-xl py-3 font-display font-semibold"
