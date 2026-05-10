@@ -1965,10 +1965,18 @@ const photoStore = {
       createThumbnail(file),
     ]);
     
+    // Use custom date if provided, otherwise now. Custom date stored as local-noon to avoid TZ shifts.
+    let dateObj = new Date();
+    if (metadata.dateISO) {
+      const customD = new Date(metadata.dateISO);
+      customD.setHours(12, 0, 0, 0);
+      dateObj = customD;
+    }
+    
     const photo = {
       id: `photo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      dateISO: new Date().toISOString(),
-      date: new Date().toDateString(),
+      dateISO: dateObj.toISOString(),
+      date: dateObj.toDateString(),
       blob: resized.blob,
       thumbnail: thumb,
       width: resized.width,
@@ -2394,6 +2402,8 @@ const App = () => {
   // Photo state
   const [photos, setPhotos] = uS([]);
   const [photoStorage, setPhotoStorage] = uS(null);
+  const [compareMode, setCompareMode] = uS(false);
+  const [comparePhotoA, setComparePhotoA] = uS(null);
   const [dashboardEditMode, setDashboardEditMode] = uS(false);
   const [longPressTimer, setLongPressTimer] = uS(null);
   // Food tab: which date are we viewing? null = today
@@ -4528,17 +4538,26 @@ const App = () => {
           e('div', null,
             e('h3', { className: "text-white font-display font-semibold flex items-center gap-2" },
               e(Icon, { d: icons.camera, size: 16, className: "text-pink-400" }),
-              "Progress photos"
+              compareMode ? "Pick a photo to compare" : "Progress photos"
             ),
             e('p', { className: "text-zinc-500 text-xs font-mono-d uppercase mt-1" }, 
-              `${photos.length} photo${photos.length !== 1 ? 's' : ''}`,
-              photoStorage && photoStorage.usedMB > 0 ? ` · ${photoStorage.usedMB}MB used` : ''
+              compareMode 
+                ? `vs newest · ${photos.length > 0 ? new Date(photos[0].dateISO).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : ''}`
+                : `${photos.length} photo${photos.length !== 1 ? 's' : ''}`,
+              !compareMode && photoStorage && photoStorage.usedMB > 0 ? ` · ${photoStorage.usedMB}MB used` : ''
             )
           ),
-          e('button', { 
-            onClick: () => setModal('photo-add'),
-            className: "bg-pink-500/20 text-pink-300 rounded-lg px-2.5 py-1 text-[10px] font-mono-d uppercase active:scale-95 flex items-center gap-1"
-          }, e(Icon, { d: icons.plus, size: 11 }), "add")
+          e('div', { className: "flex gap-2" },
+            // Compare toggle (only when 2+ photos exist)
+            photos.length >= 2 && e('button', { 
+              onClick: () => { setCompareMode(!compareMode); setComparePhotoA(null); },
+              className: `rounded-lg px-2.5 py-1 text-[10px] font-mono-d uppercase active:scale-95 flex items-center gap-1 ${compareMode ? 'bg-zinc-700 text-white' : 'bg-purple-500/20 text-purple-300'}`
+            }, compareMode ? "✕ cancel" : "⇄ compare"),
+            !compareMode && e('button', { 
+              onClick: () => setModal('photo-add'),
+              className: "bg-pink-500/20 text-pink-300 rounded-lg px-2.5 py-1 text-[10px] font-mono-d uppercase active:scale-95 flex items-center gap-1"
+            }, e(Icon, { d: icons.plus, size: 11 }), "add")
+          )
         ),
         
         photos.length === 0 ?
@@ -4549,17 +4568,33 @@ const App = () => {
               "Weekly progress pics show changes the scale misses. Photos stored only on your phone."
             )
           ) :
-          e('div', { className: "grid grid-cols-3 gap-2" },
-            photos.slice(0, 12).map(photo => 
-              e(PhotoThumbnail, {
-                key: photo.id,
-                photo,
-                onClick: () => setModal({ type: 'photo-view', photo })
-              })
+          e(React.Fragment, null,
+            // In compare mode, show hint
+            compareMode && e('div', { className: "bg-purple-500/10 border border-purple-500/30 rounded-lg p-2.5 mb-3" },
+              e('p', { className: "text-purple-200 text-[11px] font-mono-d leading-snug" }, 
+                `Tap any older photo to see it side-by-side with the newest one (${new Date(photos[0].dateISO).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}).`
+              )
+            ),
+            e('div', { className: "grid grid-cols-3 gap-2" },
+              // In compare mode, hide the newest (it's always the right side)
+              (compareMode ? photos.slice(1, 13) : photos.slice(0, 12)).map(photo => 
+                e(PhotoThumbnail, {
+                  key: photo.id,
+                  photo,
+                  onClick: () => {
+                    if (compareMode) {
+                      setComparePhotoA(photo);
+                      setModal({ type: 'photo-compare', photoA: photo, photoB: photos[0] });
+                    } else {
+                      setModal({ type: 'photo-view', photo });
+                    }
+                  }
+                })
+              )
             )
           ),
         
-        photos.length > 12 && e('p', { className: "text-zinc-600 text-xs text-center mt-3 font-mono-d" }, 
+        photos.length > 12 && !compareMode && e('p', { className: "text-zinc-600 text-xs text-center mt-3 font-mono-d" }, 
           `+${photos.length - 12} more in archive`
         )
       ),
@@ -4779,6 +4814,13 @@ const App = () => {
         setModal(null);
         setData(prev => ({ ...prev, _photoRefresh: Date.now() }));
       }
+    }),
+    
+    // Photo compare modal
+    modal && modal.type === 'photo-compare' && e(PhotoCompareModal, {
+      photoA: modal.photoA,
+      photoB: modal.photoB,
+      onClose: () => { setModal(null); setCompareMode(false); setComparePhotoA(null); }
     }),
     
     // Saved meals modal
@@ -5552,6 +5594,7 @@ const PhotoAddModal = ({ data, onClose, onSaved }) => {
   const [angle, setAngle] = uS('front');
   const [notes, setNotes] = uS("");
   const [includeWeight, setIncludeWeight] = uS(true);
+  const [photoDate, setPhotoDate] = uS(todayLocalISO()); // local YYYY-MM-DD
   const [saving, setSaving] = uS(false);
   const [error, setError] = uS(null);
   const photoInputRef = uR(null);
@@ -5568,10 +5611,14 @@ const PhotoAddModal = ({ data, onClose, onSaved }) => {
     setSaving(true);
     setError(null);
     try {
+      // Build dateISO from photoDate (local time at noon)
+      const d = fromLocalISO(photoDate);
+      d.setHours(12, 0, 0, 0);
       await photoStore.add(file, {
         weight: includeWeight ? data.bodyWeight : null,
         notes,
         angle,
+        dateISO: d.toISOString(),
       });
       onSaved();
     } catch (err) {
@@ -5615,6 +5662,48 @@ const PhotoAddModal = ({ data, onClose, onSaved }) => {
             className: "absolute top-2 right-2 w-8 h-8 rounded-full bg-black/70 backdrop-blur flex items-center justify-center"
           }, e(Icon, { d: icons.x, size: 16, className: "text-white" }))
         ),
+        
+        // Photo date picker
+        (() => {
+          const todayISO = todayLocalISO();
+          const isToday = photoDate === todayISO;
+          const chips = [];
+          for (let i = 0; i < 5; i++) {
+            const d = new Date();
+            d.setDate(d.getDate() - i);
+            chips.push({
+              iso: toLocalISO(d),
+              label: i === 0 ? "Today" : i === 1 ? "Yesterday" : d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+            });
+          }
+          
+          return e('div', { className: `rounded-xl p-3 mb-4 border ${!isToday ? 'bg-purple-500/10 border-purple-500/30' : 'bg-zinc-800 border-white/5'}` },
+            e('div', { className: "flex justify-between items-center mb-2" },
+              e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase flex items-center gap-1" },
+                e(Icon, { d: icons.clock, size: 10 }),
+                "Photo date"
+              ),
+              !isToday && e('span', { className: "text-[9px] bg-purple-500/30 text-purple-300 px-1.5 py-0.5 rounded font-mono-d uppercase" }, "backdated")
+            ),
+            e('p', { className: "text-white font-display font-bold text-sm mb-2" }, 
+              fromLocalISO(photoDate).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' })
+            ),
+            e('div', { className: "flex gap-1.5 overflow-x-auto scrollbar-hide pb-1 mb-2" },
+              chips.map(c => e('button', {
+                key: c.iso,
+                onClick: () => setPhotoDate(c.iso),
+                className: `flex-shrink-0 rounded-md px-2.5 py-1 text-[10px] font-mono-d uppercase ${photoDate === c.iso ? 'bg-emerald-400 text-black' : 'bg-zinc-900 text-zinc-400'}`
+              }, c.label))
+            ),
+            e('input', {
+              type: "date",
+              value: photoDate,
+              max: todayLocalISO(),
+              onChange: (ev) => { if (ev.target.value) setPhotoDate(ev.target.value); },
+              className: "w-full bg-zinc-900 text-white rounded-lg px-3 py-2 text-xs font-mono-d outline-none focus:ring-2 focus:ring-purple-400"
+            })
+          );
+        })(),
         
         // Angle selector
         e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase mb-2" }, "Angle"),
@@ -5679,6 +5768,113 @@ const PhotoAddModal = ({ data, onClose, onSaved }) => {
           )
         )
       )
+  );
+};
+
+const PhotoCompareModal = ({ photoA, photoB, onClose }) => {
+  // photoA = older photo selected, photoB = newest reference
+  const [urlA, setUrlA] = uS(null);
+  const [urlB, setUrlB] = uS(null);
+  
+  uE(() => {
+    const a = URL.createObjectURL(photoA.blob);
+    const b = URL.createObjectURL(photoB.blob);
+    setUrlA(a);
+    setUrlB(b);
+    return () => { URL.revokeObjectURL(a); URL.revokeObjectURL(b); };
+  }, [photoA.id, photoB.id]);
+  
+  // Compute diffs for the info bar
+  const dateA = new Date(photoA.dateISO);
+  const dateB = new Date(photoB.dateISO);
+  const daysApart = Math.round(Math.abs(dateB - dateA) / (1000 * 60 * 60 * 24));
+  const weightDiff = (photoA.weight && photoB.weight) ? (photoB.weight - photoA.weight) : null;
+  
+  const angleEmoji = (angle) => angle === 'side' ? '🚶' : angle === 'back' ? '🧍‍♂️' : '🧍';
+  
+  return e('div', { 
+    className: "fixed inset-0 bg-black z-50 flex flex-col"
+  },
+    // Top bar
+    e('div', { 
+      className: "flex justify-between items-center p-4 pt-safe bg-black/95 backdrop-blur"
+    },
+      e('button', { 
+        onClick: onClose,
+        className: "w-10 h-10 rounded-full bg-zinc-800 flex items-center justify-center"
+      }, e(Icon, { d: icons.x, size: 18, className: "text-white" })),
+      e('div', { className: "text-center" },
+        e('p', { className: "text-white font-display font-semibold text-sm" }, "Compare"),
+        e('p', { className: "text-zinc-500 text-[10px] font-mono-d" }, 
+          `${daysApart} day${daysApart !== 1 ? 's' : ''} apart`
+        )
+      ),
+      e('div', { className: "w-10" }) // spacer
+    ),
+    
+    // Side-by-side images
+    e('div', { className: "flex-1 flex bg-zinc-950 overflow-hidden" },
+      // Left (older, photoA)
+      e('div', { className: "flex-1 relative border-r border-white/10" },
+        urlA && e('img', { 
+          src: urlA,
+          className: "absolute inset-0 w-full h-full object-contain"
+        }),
+        e('div', { className: "absolute top-2 left-2 bg-purple-500/80 backdrop-blur text-white text-[10px] font-mono-d uppercase px-2 py-1 rounded font-bold" },
+          `${angleEmoji(photoA.angle)} BEFORE`
+        ),
+        e('div', { className: "absolute bottom-2 left-2 right-2 bg-black/70 backdrop-blur rounded p-1.5 text-center" },
+          e('p', { className: "text-white text-[11px] font-display font-bold" }, 
+            new Date(photoA.dateISO).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+          ),
+          photoA.weight && e('p', { className: "text-zinc-300 text-[10px] font-mono-d" }, `${photoA.weight}kg`)
+        )
+      ),
+      // Right (newer, photoB)
+      e('div', { className: "flex-1 relative" },
+        urlB && e('img', { 
+          src: urlB,
+          className: "absolute inset-0 w-full h-full object-contain"
+        }),
+        e('div', { className: "absolute top-2 right-2 bg-emerald-500/80 backdrop-blur text-black text-[10px] font-mono-d uppercase px-2 py-1 rounded font-bold" },
+          `${angleEmoji(photoB.angle)} NOW`
+        ),
+        e('div', { className: "absolute bottom-2 left-2 right-2 bg-black/70 backdrop-blur rounded p-1.5 text-center" },
+          e('p', { className: "text-white text-[11px] font-display font-bold" }, 
+            new Date(photoB.dateISO).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+          ),
+          photoB.weight && e('p', { className: "text-zinc-300 text-[10px] font-mono-d" }, `${photoB.weight}kg`)
+        )
+      )
+    ),
+    
+    // Bottom info bar
+    e('div', { 
+      className: "p-4 pb-safe bg-zinc-900/95 backdrop-blur border-t border-white/5"
+    },
+      e('div', { className: "grid grid-cols-3 gap-3 text-center" },
+        e('div', null,
+          e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Days"),
+          e('p', { className: "text-white text-base font-display font-bold" }, daysApart)
+        ),
+        e('div', null,
+          e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Weight"),
+          e('p', { className: `text-base font-display font-bold ${weightDiff === null ? 'text-zinc-500' : weightDiff < 0 ? 'text-emerald-400' : weightDiff > 0 ? 'text-orange-400' : 'text-white'}` }, 
+            weightDiff === null ? "—" : (weightDiff > 0 ? `+${weightDiff.toFixed(1)}` : weightDiff.toFixed(1)),
+            weightDiff !== null && e('span', { className: "text-xs text-zinc-500 ml-1" }, "kg")
+          )
+        ),
+        e('div', null,
+          e('p', { className: "text-[9px] text-zinc-500 font-mono-d uppercase" }, "Angle"),
+          e('p', { className: "text-white text-base font-display font-bold" }, 
+            photoA.angle === photoB.angle ? `${angleEmoji(photoA.angle)} match` : "⚠ differ"
+          )
+        )
+      ),
+      photoA.angle !== photoB.angle && e('p', { className: "text-orange-300/80 text-[10px] font-mono-d text-center mt-2" }, 
+        "Different angles — comparison may be misleading"
+      )
+    )
   );
 };
 
