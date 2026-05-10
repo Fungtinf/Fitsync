@@ -870,7 +870,13 @@ const buildSleepData = (sleepHistory, todaySleep) => {
 const calculateHealthScore = (data, sleepData, exerciseProgress) => {
   const today = new Date().toDateString();
   const archived = data.coachingHistory || [];
-  const allWorkouts = [...(data.workoutHistory || []), ...(data.workouts || [])];
+  // Combine + sort by date so .slice(-N) actually returns the latest N
+  const allWorkouts = [...(data.workoutHistory || []), ...(data.workouts || [])]
+    .sort((a, b) => {
+      const da = new Date(a.dateISO || a.date || 0).getTime();
+      const db = new Date(b.dateISO || b.date || 0).getTime();
+      return da - db;
+    });
   
   // ====== SLEEP DIMENSION (25 points) ======
   let sleepScore = 0;
@@ -1208,33 +1214,47 @@ const calculateMomentum = (data) => {
     const dayIdx = d.getDay();
     const target = (data.workoutSchedule || {})[dayIdx];
     
-    let meals = [], workouts = [], sleepHours = null;
+    let meals = [], workouts = [], sleepHours = null, steps = 0;
     
     if (dStr === today) {
       meals = data.meals || [];
       workouts = data.workouts || [];
       sleepHours = data.sleepHours;
+      steps = data.steps || 0;
     } else {
+      // Pull meals + sleep + steps from coachingHistory (where backdated meal/sleep/step data lives)
       const archDay = archived.find(a => a.date === dStr);
       if (archDay) {
         meals = archDay.meals || [];
         sleepHours = archDay.sleepHours;
+        steps = archDay.steps || 0;
       }
+      // Pull workouts from workoutHistory (where backdated workouts live)
       const archWorkouts = (data.workoutHistory || []).filter(w => w.date === dStr);
       workouts = archWorkouts;
     }
     
-    // Determine if day was "healthy"
-    const loggedFood = meals.length >= 1;
+    // Signals of a "consistent" day — any of these counts:
     const trainedOnTargetDay = target === 'workout' && workouts.length > 0;
     const restedOnRestDay = target === 'rest' && workouts.length === 0;
+    const trainedAnyDay = workouts.length > 0; // logged a workout (counts even on flex/rest)
+    const loggedFood = meals.length >= 2; // at least 2 meals = real logging effort
     const sleptEnough = sleepHours !== null && sleepHours >= 6;
-    const flexDay = !target;
+    const movedEnough = steps >= 5000;
     
-    // Healthy = food logged AND one of: workout on training day, rest on rest day, sleep on flex day
-    const isHealthy = loggedFood && (trainedOnTargetDay || restedOnRestDay || flexDay || sleptEnough);
+    // Day is "healthy" if ANY of: training kept (target day), rest kept, food logged, slept enough, or moved enough
+    // This is OR logic, not AND — so backdating just one thing still counts
+    const isHealthy = trainedOnTargetDay || restedOnRestDay || trainedAnyDay || loggedFood || sleptEnough || movedEnough;
     
-    days.push({ date: dStr, isHealthy, loggedFood, trainedOnTargetDay, restedOnRestDay, sleepHours, isToday: dStr === today });
+    days.push({ 
+      date: dStr, 
+      isHealthy, 
+      hasWorkout: workouts.length > 0,
+      hasFood: meals.length > 0,
+      hasSleep: sleepHours !== null,
+      hasSteps: steps > 0,
+      isToday: dStr === today,
+    });
   }
   
   // Last 7 days for the headline number
@@ -1315,9 +1335,15 @@ const calculateRecoveryReadiness = (data) => {
     factors.push({ label: "Well rested", value: "0 sessions", sign: "+" });
   }
   
-  // Recent energy levels (last 3 workouts)
+  // Recent energy levels (last 3 workouts, by date)
   const allWorkouts = [...(data.workoutHistory || []), ...(data.workouts || [])];
-  const recentEnergy = allWorkouts
+  // Sort by date (newest last) so .slice(-3) really gets the latest
+  const sortedWorkouts = allWorkouts.sort((a, b) => {
+    const da = new Date(a.dateISO || a.date || 0).getTime();
+    const db = new Date(b.dateISO || b.date || 0).getTime();
+    return da - db;
+  });
+  const recentEnergy = sortedWorkouts
     .filter(w => w.energyLevel)
     .slice(-3);
   if (recentEnergy.length > 0) {
@@ -1430,15 +1456,21 @@ const generateAICoaching = async (data, apiKey) => {
   const todayBalance = todayEaten - tdee - todayBurned;
   
   // Build last 7 days summary
-  const recentDays = (data.coachingHistory || []).slice(-7).map(d => ({
-    date: d.date,
-    eaten: d.totalEaten,
-    burned: d.totalBurned,
-    balance: d.totalEaten - tdee - d.totalBurned,
-    workouts: d.workouts.map(w => ({ name: w.name, duration: w.duration, kcal: w.kcal })),
-    sleepHours: d.sleepHours,
-    steps: d.steps,
-  }));
+  // Combine coachingHistory (food/sleep/etc) with workoutHistory (which holds backdated workouts)
+  const recentDays = (data.coachingHistory || []).slice(-7).map(d => {
+    // Look up workouts for this date from workoutHistory, fall back to archived workouts
+    const workoutsForDay = (data.workoutHistory || []).filter(w => w.date === d.date);
+    const allDayWorkouts = workoutsForDay.length > 0 ? workoutsForDay : (d.workouts || []);
+    return {
+      date: d.date,
+      eaten: d.totalEaten,
+      burned: allDayWorkouts.reduce((s, w) => s + (w.kcal || 0), 0),
+      balance: d.totalEaten - tdee - allDayWorkouts.reduce((s, w) => s + (w.kcal || 0), 0),
+      workouts: allDayWorkouts.map(w => ({ name: w.name, duration: w.duration, kcal: w.kcal, energyLevel: w.energyLevel })),
+      sleepHours: d.sleepHours,
+      steps: d.steps,
+    };
+  });
   
   // Weight trend
   const weightTrend = data.weightHistory.slice(-4).map(w => ({
