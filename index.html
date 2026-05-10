@@ -2526,10 +2526,13 @@ const App = () => {
     
     if (isBackdated) {
       // Add directly to workoutHistory with the past date
+      // dateISO uses LOCAL noon to avoid UTC midnight shifting the day
+      const localDate = fromLocalISO(targetDate);
+      localDate.setHours(12, 0, 0, 0);
       const datedWorkout = {
         ...newWorkout,
         date: dateForWorkout,
-        dateISO: fromLocalISO(targetDate).toISOString(),
+        dateISO: localDate.toISOString(),
         backdated: true,
       };
       updateData({ 
@@ -3993,7 +3996,7 @@ const App = () => {
                   )
                 ),
                 e('p', { className: "text-zinc-500 text-[10px] font-mono-d" }, 
-                  `${new Date(w.dateISO || w.date).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · ${w.duration}min · ${w.kcal} kcal`
+                  `${new Date(w.date || w.dateISO).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · ${w.duration}min · ${w.kcal} kcal`
                 )
               ),
               e(Icon, { d: icons.chevron, size: 12, className: "text-zinc-600" })
@@ -4787,17 +4790,58 @@ const App = () => {
       trainingGoal: data.trainingGoal || "progressive_overload",
       onClose: () => setEditingWorkout(null),
       onSave: (updated) => {
-        // Determine if this workout lives in workoutHistory (backdated) or today's workouts
-        const isInHistory = (data.workoutHistory || []).some(w => w.id === updated.id);
-        if (isInHistory) {
-          updateData({ 
-            workoutHistory: data.workoutHistory.map(w => w.id === updated.id ? { ...updated, date: w.date, dateISO: w.dateISO, backdated: w.backdated } : w)
-          });
+        // Determine where this workout currently lives and where it should go after edit
+        const wasInHistory = (data.workoutHistory || []).some(w => w.id === updated.id);
+        const today = new Date().toDateString();
+        // The updated workout's intended date. If user changed date in modal, it's set.
+        // If user didn't change date, fall back to original.
+        const updatedDate = updated.date || (wasInHistory 
+          ? (data.workoutHistory.find(w => w.id === updated.id)?.date) 
+          : today);
+        const shouldBeInHistory = updatedDate !== today;
+        
+        // Build the canonical updated record
+        let finalUpdate;
+        if (shouldBeInHistory) {
+          // Use updated.dateISO if user changed it, otherwise rebuild from updatedDate
+          let dateISO = updated.dateISO;
+          if (!dateISO) {
+            const d = new Date(updatedDate);
+            d.setHours(12, 0, 0, 0);
+            dateISO = d.toISOString();
+          }
+          finalUpdate = { ...updated, date: updatedDate, dateISO, backdated: true };
         } else {
-          updateData({ 
-            workouts: data.workouts.map(w => w.id === updated.id ? updated : w)
-          });
+          // Today — strip backdating fields
+          finalUpdate = { ...updated };
+          delete finalUpdate.backdated;
+          // Keep date as today's toDateString in case downstream code needs it
+          finalUpdate.date = today;
+          finalUpdate.dateISO = new Date().toISOString();
         }
+        
+        // Now move between workouts/workoutHistory if needed
+        let updates = {};
+        if (wasInHistory && shouldBeInHistory) {
+          // Stay in history, just update
+          updates.workoutHistory = data.workoutHistory.map(w => 
+            w.id === updated.id ? finalUpdate : w
+          );
+        } else if (wasInHistory && !shouldBeInHistory) {
+          // Move from history → today
+          updates.workoutHistory = data.workoutHistory.filter(w => w.id !== updated.id);
+          updates.workouts = [...data.workouts, finalUpdate];
+        } else if (!wasInHistory && shouldBeInHistory) {
+          // Move from today → history
+          updates.workouts = data.workouts.filter(w => w.id !== updated.id);
+          updates.workoutHistory = [...(data.workoutHistory || []), finalUpdate].slice(-500);
+        } else {
+          // Stay in today
+          updates.workouts = data.workouts.map(w => 
+            w.id === updated.id ? finalUpdate : w
+          );
+        }
+        updateData(updates);
         setEditingWorkout(null);
       },
       onDelete: () => {
@@ -6616,6 +6660,71 @@ const EditWorkoutModal = ({ workout, bodyWeight, workoutHistory, trainingGoal, o
         })
       )
     ),
+    
+    // ─── WORKOUT DATE PICKER ───
+    (() => {
+      const todayStr = new Date().toDateString();
+      // Determine which day this workout belongs to
+      const currentDateStr = w.date || todayStr;
+      const isToday = currentDateStr === todayStr;
+      // Convert to YYYY-MM-DD for the date input
+      const currentDateForInput = (() => {
+        const d = new Date(currentDateStr);
+        return toLocalISO(d);
+      })();
+      
+      const setWorkoutDate = (newISO) => {
+        const newD = fromLocalISO(newISO);
+        newD.setHours(12, 0, 0, 0);
+        const newDateStr = newD.toDateString();
+        const newIsToday = newDateStr === todayStr;
+        setW({ 
+          ...w, 
+          date: newDateStr,
+          dateISO: newD.toISOString(),
+          backdated: !newIsToday,
+        });
+      };
+      
+      // Quick-pick chips (today + last 7 days)
+      const chips = [];
+      for (let i = 0; i < 8; i++) {
+        const d = new Date();
+        d.setDate(d.getDate() - i);
+        chips.push({
+          iso: toLocalISO(d),
+          label: i === 0 ? "Today" : i === 1 ? "Yesterday" : d.toLocaleDateString('en-US', { weekday: 'short' }),
+          isSelected: toLocalISO(d) === currentDateForInput,
+        });
+      }
+      
+      return e('div', { className: `rounded-xl p-3 mb-4 border ${!isToday ? 'bg-purple-500/10 border-purple-500/30' : 'bg-zinc-800 border-white/5'}` },
+        e('div', { className: "flex justify-between items-center mb-2" },
+          e('p', { className: "text-[10px] text-zinc-500 font-mono-d uppercase flex items-center gap-1" },
+            e(Icon, { d: icons.clock, size: 10 }),
+            "Workout date"
+          ),
+          !isToday && e('span', { className: "text-[9px] bg-purple-500/30 text-purple-300 px-1.5 py-0.5 rounded font-mono-d uppercase" }, "backdated")
+        ),
+        e('p', { className: "text-white font-display font-bold text-sm mb-2" }, 
+          new Date(currentDateStr).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' })
+        ),
+        e('div', { className: "flex gap-1.5 overflow-x-auto scrollbar-hide pb-1 mb-2" },
+          chips.map(c => e('button', {
+            key: c.iso,
+            onClick: () => setWorkoutDate(c.iso),
+            className: `flex-shrink-0 rounded-md px-2.5 py-1 text-[10px] font-mono-d uppercase ${c.isSelected ? 'bg-emerald-400 text-black' : 'bg-zinc-900 text-zinc-400'}`
+          }, c.label))
+        ),
+        e('input', {
+          type: "date",
+          value: currentDateForInput,
+          max: toLocalISO(new Date()),
+          onChange: (ev) => { if (ev.target.value) setWorkoutDate(ev.target.value); },
+          className: "w-full bg-zinc-900 text-white rounded-lg px-3 py-2 text-xs font-mono-d outline-none focus:ring-2 focus:ring-emerald-400"
+        })
+      );
+    })(),
     e('div', { className: "bg-orange-500/10 border border-orange-500/20 rounded-xl p-3 mb-2" },
       e('p', { className: "text-[9px] text-orange-400 font-mono-d uppercase mb-1 flex items-center justify-between" }, 
         "Calories burned",
