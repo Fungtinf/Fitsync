@@ -1853,9 +1853,9 @@ const autoSyncFromInflux = async () => {
 
   const TZ = 'import "timezone"\noption location = timezone.location(name: "Europe/Zurich")\n';
   const [stepsR, exR, enR, slR, hrR] = await Promise.all([
-    q(TZ + `from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r.domain=="hae" and r.entity_id=="health_step_count" and r._field=="value") |> aggregateWindow(every: 1d, fn: max, createEmpty: false, timeSrc: "_start")`),
-    q(TZ + `from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r.domain=="hae" and r.entity_id=="health_apple_exercise_time" and r._field=="value") |> aggregateWindow(every: 1d, fn: max, createEmpty: false, timeSrc: "_start")`),
-    q(TZ + `from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r.domain=="hae" and r.entity_id=="health_active_energy" and r._field=="value") |> aggregateWindow(every: 1d, fn: max, createEmpty: false, timeSrc: "_start")`),
+    q(TZ + `from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r.domain=="hae" and r.entity_id=="health_step_count" and r._field=="value") |> aggregateWindow(every: 1d, fn: last, createEmpty: false, timeSrc: "_start")`),
+    q(TZ + `from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r.domain=="hae" and r.entity_id=="health_apple_exercise_time" and r._field=="value") |> aggregateWindow(every: 1d, fn: last, createEmpty: false, timeSrc: "_start")`),
+    q(TZ + `from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r.domain=="hae" and r.entity_id=="health_active_energy" and r._field=="value") |> aggregateWindow(every: 1d, fn: last, createEmpty: false, timeSrc: "_start")`),
     q(`from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r._measurement=="garmin_sleep" and r._field=="total_h")`),
     q(`from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r._measurement=="garmin_daily" and r._field=="resting_hr")`),
   ]);
