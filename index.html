@@ -3845,8 +3845,16 @@ const App = () => {
               e('div', { className: "bg-purple-400", style: { width: `${(data.sleepPhases.rem_h || 0) / data.sleepPhases.total_h * 100}%` } }),
               e('div', { className: "bg-orange-400", style: { width: `${(data.sleepPhases.awake_h || 0) / data.sleepPhases.total_h * 100}%` } })
             ),
-            e('p', { className: "text-[9px] text-zinc-500 font-mono-d mt-1" }, 
-              `${data.sleepPhases.deep_h || 0}h tief · ${data.sleepPhases.rem_h || 0}h REM · ${data.sleepPhases.light_h || 0}h leicht`
+            e('div', { className: "flex flex-wrap gap-x-2 gap-y-0.5 mt-1.5" },
+              [
+                ["bg-blue-700", "Tief", data.sleepPhases.deep_h],
+                ["bg-indigo-400", "Leicht", data.sleepPhases.light_h],
+                ["bg-purple-400", "REM", data.sleepPhases.rem_h],
+                ["bg-orange-400", "Wach", data.sleepPhases.awake_h],
+              ].map(([c, label, val], i) => e('span', { key: i, className: "flex items-center gap-1 text-[9px] text-zinc-500 font-mono-d" },
+                e('span', { className: `w-2 h-2 rounded-full ${c}` }),
+                `${label} ${val || 0}h`
+              ))
             )
           ) :
           e('p', { className: "text-zinc-500 text-xs font-mono-d" }, 
