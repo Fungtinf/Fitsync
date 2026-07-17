@@ -1771,9 +1771,51 @@ const loadData = () => {
   }
 };
 
+// ===== InfluxDB Sync =====
+const INFLUX_WRITE_URL = "/influx/api/v2/write?org=home&bucket=homeassistant&precision=s";
+const INFLUX_TOKEN = "fa093310aab9834e733d8754381a65f3a912e36f8aef970ad17d8fa52f7bbd0f";
+const _iesc = (s) => String(s).replace(/[ ,=]/g, "_");
+const buildInfluxLines = (data) => {
+  const lines = [];
+  const now = new Date();
+  const dayTs = Math.floor(new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12).getTime() / 1000);
+  const eaten = (data.meals || []).reduce((s, m) => s + (m.kcal || 0), 0);
+  const protein = (data.meals || []).reduce((s, m) => s + (m.protein || 0), 0);
+  const burned = (data.workouts || []).reduce((s, w) => s + (w.kcal || 0), 0);
+  const f = [`eaten=${eaten}`, `protein=${protein}`, `burned=${burned}`,
+    `water=${data.water || 0}`, `steps=${data.steps || 0}`, `weight=${data.bodyWeight || 0}`];
+  if (data.sleepHours != null) f.push(`sleep=${data.sleepHours}`);
+  if (data.restingHR != null) f.push(`resting_hr=${data.restingHR}`);
+  lines.push(`fitsync_daily ${f.join(",")} ${dayTs}`);
+  for (const wh of (data.weightHistory || []).slice(-100)) {
+    const ts = Math.floor(new Date(wh.date).getTime() / 1000);
+    if (!isNaN(ts)) lines.push(`fitsync_weight weight=${wh.weight} ${ts}`);
+  }
+  for (const m of (data.meals || [])) {
+    if (m.id) lines.push(`fitsync_meal,name=${_iesc(m.name)} kcal=${m.kcal || 0},protein=${m.protein || 0} ${Math.floor(m.id / 1000)}`);
+  }
+  for (const w of (data.workouts || [])) {
+    if (w.id) lines.push(`fitsync_workout,name=${_iesc(w.name)} kcal=${w.kcal || 0},duration=${w.duration || 0},volume=${w.totalVolume || 0} ${Math.floor(w.id / 1000)}`);
+  }
+  return lines;
+};
+let _influxTimer = null;
+const syncToInflux = (data) => {
+  clearTimeout(_influxTimer);
+  _influxTimer = setTimeout(() => {
+    try {
+      fetch(INFLUX_WRITE_URL, {
+        method: "POST",
+        headers: { "Authorization": "Token " + INFLUX_TOKEN, "Content-Type": "text/plain" },
+        body: buildInfluxLines(data).join("\n"),
+      }).catch(() => {});
+    } catch (e) {}
+  }, 3000);
+};
 const saveData = (data) => {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    syncToInflux(data);
   } catch (err) {
     console.error("Save error:", err);
   }
