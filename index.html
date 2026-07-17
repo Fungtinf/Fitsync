@@ -950,13 +950,13 @@ const calculateHealthScore = (data, sleepData, exerciseProgress) => {
     if (target === 'workout') {
       if (isPastOrToday) weekTargetDays++;
       const did = dStr === today 
-        ? data.workouts.length > 0 
+        ? data.workouts.some(w => w.name !== "Alltagsaktivität")
         : (data.workoutHistory || []).some(w => w.date === dStr);
       if (did) weekWorkoutsCompleted++;
     } else if (target === 'rest' && isPastOrToday) {
       weekRestDays++;
       const did = dStr === today 
-        ? data.workouts.length > 0 
+        ? data.workouts.some(w => w.name !== "Alltagsaktivität")
         : (data.workoutHistory || []).some(w => w.date === dStr);
       if (!did) weekRestKept++;
     }
@@ -1218,7 +1218,7 @@ const calculateMomentum = (data) => {
     
     if (dStr === today) {
       meals = data.meals || [];
-      workouts = data.workouts || [];
+      workouts = (data.workouts || []).filter(w => w.name !== "Alltagsaktivität");
       sleepHours = data.sleepHours;
       steps = data.steps || 0;
     } else {
@@ -1315,9 +1315,10 @@ const calculateRecoveryReadiness = (data) => {
   let recentVolume = 0;
   let recentSessions = 0;
   for (const dStr of recentDays) {
-    const items = dStr === today 
+    const items = (dStr === today 
       ? (data.workouts || []) 
-      : (data.workoutHistory || []).filter(w => w.date === dStr);
+      : (data.workoutHistory || []).filter(w => w.date === dStr)
+    ).filter(w => w.name !== "Alltagsaktivität");
     for (const w of items) {
       recentVolume += w.totalVolume || 0;
       recentSessions++;
@@ -1733,7 +1734,7 @@ const loadData = () => {
       
       // Archive workouts into long-term history (180 days) with date attached
       if (parsed.workouts && parsed.workouts.length > 0) {
-        const datedWorkouts = parsed.workouts.map(w => ({
+        const datedWorkouts = parsed.workouts.filter(w => w.name !== "Alltagsaktivität").map(w => ({
           ...w, 
           date: parsed.lastDate, 
           dateISO: new Date(parsed.lastDate).toISOString()
@@ -1819,6 +1820,123 @@ const saveData = (data) => {
   } catch (err) {
     console.error("Save error:", err);
   }
+};
+
+// ===== Auto-Import aus InfluxDB =====
+const influxQueryRows = async (flux) => {
+  const res = await fetch("/influx/api/v2/query?org=home", {
+    method: "POST",
+    headers: {
+      "Authorization": "Token " + INFLUX_TOKEN,
+      "Content-Type": "application/vnd.flux",
+      "Accept": "application/csv",
+    },
+    body: flux,
+  });
+  if (!res.ok) throw new Error("influx query failed");
+  const lines = (await res.text()).split("\n").filter(l => l && !l.startsWith("#"));
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(",");
+  const vi = headers.indexOf("_value");
+  const ti = headers.indexOf("_time");
+  return lines.slice(1).map(l => {
+    const c = l.split(",");
+    return { time: c[ti], value: parseFloat(c[vi]) };
+  }).filter(r => r.time && !isNaN(r.value));
+};
+
+const autoSyncFromInflux = async () => {
+  const data = loadData();
+  let changed = false;
+  const today = new Date().toDateString();
+  const q = (flux) => influxQueryRows(flux).catch(() => []);
+
+  const [stepsR, exR, enR, slR, hrR] = await Promise.all([
+    q(`from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r.domain=="hae" and r.entity_id=="health_step_count" and r._field=="value") |> aggregateWindow(every: 1d, fn: max, createEmpty: false, timeSrc: "_start")`),
+    q(`from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r.domain=="hae" and r.entity_id=="health_apple_exercise_time" and r._field=="value") |> aggregateWindow(every: 1d, fn: max, createEmpty: false, timeSrc: "_start")`),
+    q(`from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r.domain=="hae" and r.entity_id=="health_active_energy" and r._field=="value") |> aggregateWindow(every: 1d, fn: max, createEmpty: false, timeSrc: "_start")`),
+    q(`from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r._measurement=="garmin_sleep" and r._field=="total_h")`),
+    q(`from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r._measurement=="garmin_daily" and r._field=="resting_hr")`),
+  ]);
+  const byDay = (rows) => {
+    const m = {};
+    for (const r of rows) m[new Date(r.time).toDateString()] = r.value;
+    return m;
+  };
+  const stepsD = byDay(stepsR), exD = byDay(exR), enD = byDay(enR), slD = byDay(slR), hrD = byDay(hrR);
+
+  // --- HEUTE ---
+  if (stepsD[today] != null && Math.round(stepsD[today]) > (data.steps || 0)) {
+    data.stepEntries = [...(data.stepEntries || []), {
+      time: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
+      count: Math.round(stepsD[today]), dateISO: new Date().toISOString(), auto: true,
+    }];
+    data.steps = Math.round(stepsD[today]);
+    changed = true;
+  }
+  if (slD[today] != null) {
+    const v = Math.round(slD[today] * 10) / 10;
+    if (data.sleepHours !== v) { data.sleepHours = v; changed = true; }
+  }
+  if (hrD[today] != null) {
+    const v = Math.round(hrD[today]);
+    if (data.restingHR !== v) { data.restingHR = v; changed = true; }
+  }
+  if (enD[today] != null) {
+    const kcal = Math.round(enD[today] / 4.184);
+    let auto = (data.workouts || []).find(w => w.auto === true);
+    if (auto) {
+      if (auto.kcal !== kcal) { auto.kcal = kcal; changed = true; }
+    } else if (kcal > 0) {
+      data.workouts = [...(data.workouts || []), {
+        id: Date.now(), name: "Alltagsaktivität", auto: true, kcal,
+        duration: Math.round(exD[today] || 0), time: "auto", icon: "🚶", exercises: [],
+      }];
+      changed = true;
+    }
+  }
+
+  // --- LETZTE 14 TAGE ins Tagesarchiv (Momentum / Health Score) ---
+  const hist = [...(data.coachingHistory || [])];
+  for (let i = 1; i <= 14; i++) {
+    const d = new Date(); d.setDate(d.getDate() - i);
+    const ds = d.toDateString();
+    if (stepsD[ds] == null && slD[ds] == null && exD[ds] == null) continue;
+    let entry = hist.find(h => h.date === ds);
+    if (!entry) {
+      entry = { date: ds, meals: [], workouts: [], water: 0, steps: 0, sleepHours: null, totalEaten: 0, totalBurned: 0 };
+      hist.push(entry);
+      changed = true;
+    }
+    if (stepsD[ds] != null && Math.round(stepsD[ds]) !== (entry.steps || 0)) {
+      entry.steps = Math.round(stepsD[ds]); changed = true;
+    }
+    if (slD[ds] != null && entry.sleepHours == null) {
+      entry.sleepHours = Math.round(slD[ds] * 10) / 10; changed = true;
+    }
+    // Trainingstag = 30+ Min Apple-Trainingszeit
+    if ((exD[ds] || 0) >= 30 && !(data.workoutHistory || []).some(w => w.date === ds)) {
+      const noon = new Date(d); noon.setHours(12, 0, 0, 0);
+      data.workoutHistory = [...(data.workoutHistory || []), {
+        id: noon.getTime(), name: "Training (Health)", auto: true, date: ds, dateISO: noon.toISOString(),
+        kcal: Math.round((enD[ds] || 0) / 4.184), duration: Math.round(exD[ds]), icon: "💪", exercises: [],
+      }].slice(-500);
+      changed = true;
+    }
+  }
+  data.coachingHistory = hist.slice(-30);
+
+  // Schlaf-Historie für Trends
+  for (const [ds, hours] of Object.entries(slD)) {
+    if (ds !== today && !(data.sleepHistory || []).some(s => s.date === ds)) {
+      data.sleepHistory = [...(data.sleepHistory || []), {
+        date: ds, dateISO: new Date(ds).toISOString(), hours: Math.round(hours * 10) / 10,
+      }].sort((a, b) => new Date(a.dateISO) - new Date(b.dateISO)).slice(-90);
+      changed = true;
+    }
+  }
+
+  if (changed) saveData(data);
 };
 
 // ============== BACKUP / RESTORE ==============
@@ -2777,7 +2895,7 @@ const App = () => {
             const exerciseProgress = buildExerciseProgress(data.workoutHistory, data.workouts);
             const recovery = calculateRecoveryReadiness(data);
             const todaySchedule = (data.workoutSchedule || {})[new Date().getDay()];
-            const workoutDoneToday = data.workouts.length > 0;
+            const workoutDoneToday = data.workouts.some(w => w.name !== "Alltagsaktivität");
             const proteinPct = Math.min(100, (totalProtein / proteinGoal) * 100);
             const calLeft = data.caloriesGoal - totalEaten;
             const calsPct = Math.min(100, (totalEaten / data.caloriesGoal) * 100);
@@ -3429,7 +3547,7 @@ const App = () => {
           
           let workoutDone = false;
           if (isToday) {
-            workoutDone = data.workouts.length > 0;
+            workoutDone = data.workouts.some(w => w.name !== "Alltagsaktivität");
           } else {
             const archived = (data.workoutHistory || []).filter(w => w.date === dStr);
             workoutDone = archived.length > 0;
@@ -8121,8 +8239,10 @@ const renderExerciseProgressCard = (ex) => {
 };
 
 // ============ RENDER ============
-createRoot(document.getElementById('root')).render(e(App));
-</script>
+(async () => {
+  try { await autoSyncFromInflux(); } catch (e) {}
+  createRoot(document.getElementById('root')).render(e(App));
+})();</script>
 
 </body>
 </html>
