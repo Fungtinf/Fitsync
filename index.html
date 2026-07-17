@@ -1869,13 +1869,20 @@ const autoSyncFromInflux = async () => {
   const stepsD = byDay(stepsR), exD = byDay(exR), enD = byDay(enR), slD = byDay(slR), hrD = byDay(hrR);
 
   // --- HEUTE ---
-  if (stepsD[today] != null && Math.round(stepsD[today]) > (data.steps || 0)) {
-    data.stepEntries = [...(data.stepEntries || []), {
-      time: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
-      count: Math.round(stepsD[today]), dateISO: new Date().toISOString(), auto: true,
-    }];
-    data.steps = Math.round(stepsD[today]);
-    changed = true;
+  if (stepsD[today] != null) {
+    const v = Math.round(stepsD[today]);
+    const manualEntries = (data.stepEntries || []).filter(en => !en.auto);
+    const prevAuto = (data.stepEntries || []).filter(en => en.auto);
+    const alreadyCurrent = prevAuto.length === 1 && prevAuto[0].count === v;
+    if (!alreadyCurrent) {
+      const newEntries = [...manualEntries, {
+        time: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
+        count: v, dateISO: new Date().toISOString(), auto: true,
+      }];
+      data.stepEntries = newEntries;
+      data.steps = stepsFromEntries(newEntries);
+      changed = true;
+    }
   }
   const yesterdayStr = (() => { const d = new Date(); d.setDate(d.getDate() - 1); return d.toDateString(); })();
   const sleepVal = slD[today] != null ? slD[today] : slD[yesterdayStr];
