@@ -1839,9 +1839,10 @@ const influxQueryRows = async (flux) => {
   const headers = lines[0].split(",");
   const vi = headers.indexOf("_value");
   const ti = headers.indexOf("_time");
+  const fi = headers.indexOf("_field");
   return lines.slice(1).map(l => {
     const c = l.split(",");
-    return { time: c[ti], value: parseFloat(c[vi]) };
+    return { time: c[ti], value: parseFloat(c[vi]), field: fi >= 0 ? c[fi] : null };
   }).filter(r => r.time && !isNaN(r.value));
 };
 
@@ -1852,12 +1853,13 @@ const autoSyncFromInflux = async () => {
   const q = (flux) => influxQueryRows(flux).catch(() => []);
 
   const TZ = 'import "timezone"\noption location = timezone.location(name: "Europe/Zurich")\n';
-  const [stepsR, exR, enR, slR, hrR] = await Promise.all([
+  const [stepsR, exR, enR, slR, hrR, slPhasesR] = await Promise.all([
     q(TZ + `from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r.domain=="hae" and r.entity_id=="health_step_count" and r._field=="value") |> aggregateWindow(every: 1d, fn: last, createEmpty: false, timeSrc: "_start")`),
     q(TZ + `from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r.domain=="hae" and r.entity_id=="health_apple_exercise_time" and r._field=="value") |> aggregateWindow(every: 1d, fn: last, createEmpty: false, timeSrc: "_start")`),
     q(TZ + `from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r.domain=="hae" and r.entity_id=="health_active_energy" and r._field=="value") |> aggregateWindow(every: 1d, fn: last, createEmpty: false, timeSrc: "_start")`),
     q(`from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r._measurement=="garmin_sleep" and r._field=="total_h")`),
     q(`from(bucket:"homeassistant") |> range(start: -14d) |> filter(fn:(r)=> r._measurement=="garmin_daily" and r._field=="resting_hr")`),
+    q(`from(bucket:"homeassistant") |> range(start: -3d) |> filter(fn:(r)=> r._measurement=="garmin_sleep") |> last()`),
   ]);
   const byDay = (rows) => {
     const m = {};
@@ -1875,13 +1877,24 @@ const autoSyncFromInflux = async () => {
     data.steps = Math.round(stepsD[today]);
     changed = true;
   }
-  if (slD[today] != null) {
-    const v = Math.round(slD[today] * 10) / 10;
+  const yesterdayStr = (() => { const d = new Date(); d.setDate(d.getDate() - 1); return d.toDateString(); })();
+  const sleepVal = slD[today] != null ? slD[today] : slD[yesterdayStr];
+  if (sleepVal != null) {
+    const v = Math.round(sleepVal * 10) / 10;
     if (data.sleepHours !== v) { data.sleepHours = v; changed = true; }
   }
-  if (hrD[today] != null) {
-    const v = Math.round(hrD[today]);
+  const hrKeys = Object.keys(hrD).sort((a, b) => new Date(a) - new Date(b));
+  const hrVal = hrD[today] != null ? hrD[today] : (hrKeys.length ? hrD[hrKeys[hrKeys.length - 1]] : null);
+  if (hrVal != null) {
+    const v = Math.round(hrVal);
     if (data.restingHR !== v) { data.restingHR = v; changed = true; }
+  }
+  // Schlafphasen (letzte erfasste Nacht, Garmin)
+  const phases = {};
+  for (const r of slPhasesR) { if (r.field) phases[r.field] = Math.round(r.value * 10) / 10; }
+  if (phases.total_h != null && JSON.stringify(data.sleepPhases || {}) !== JSON.stringify(phases)) {
+    data.sleepPhases = phases;
+    changed = true;
   }
   if (enD[today] != null) {
     const kcal = Math.round(enD[today] / 4.184);
@@ -3818,6 +3831,17 @@ const App = () => {
               e('span', { className: "text-base text-zinc-500" }, "h")
             ) :
             e('p', { className: "text-zinc-600 text-2xl font-display font-bold" }, "—"),
+          data.sleepPhases && data.sleepPhases.total_h ? e('div', null,
+            e('div', { className: "flex h-1.5 rounded-full overflow-hidden mt-2 bg-zinc-800" },
+              e('div', { className: "bg-blue-700", style: { width: `${(data.sleepPhases.deep_h || 0) / data.sleepPhases.total_h * 100}%` } }),
+              e('div', { className: "bg-indigo-400", style: { width: `${(data.sleepPhases.light_h || 0) / data.sleepPhases.total_h * 100}%` } }),
+              e('div', { className: "bg-purple-400", style: { width: `${(data.sleepPhases.rem_h || 0) / data.sleepPhases.total_h * 100}%` } }),
+              e('div', { className: "bg-orange-400", style: { width: `${(data.sleepPhases.awake_h || 0) / data.sleepPhases.total_h * 100}%` } })
+            ),
+            e('p', { className: "text-[9px] text-zinc-500 font-mono-d mt-1" }, 
+              `${data.sleepPhases.deep_h || 0}h tief · ${data.sleepPhases.rem_h || 0}h REM · ${data.sleepPhases.light_h || 0}h leicht`
+            )
+          ) :
           e('p', { className: "text-zinc-500 text-xs font-mono-d" }, 
             data.sleepHours !== null ? 
               (data.sleepHours >= 7 ? "well rested" : data.sleepHours >= 6 ? "okay" : "low — nap?") :
