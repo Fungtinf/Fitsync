@@ -2064,14 +2064,7 @@ const importBackup = async (file) => {
 
 // Check if user should see a backup reminder
 const shouldNudgeBackup = (data) => {
-  if (!data.lastBackupISO) {
-    // Never backed up — nudge if app has been used for 5+ days
-    if (!data.coachingHistory || data.coachingHistory.length < BACKUP_REMINDER_DAYS) return false;
-    return true;
-  }
-  const lastBackup = new Date(data.lastBackupISO);
-  const daysSince = (Date.now() - lastBackup.getTime()) / (1000 * 60 * 60 * 24);
-  return daysSince >= 7; // weekly reminder
+  return false; // Daten landen in InfluxDB — kein Backup-Nag mehr nötig
 };
 
 // ============== INDEXEDDB PHOTO STORAGE ==============
@@ -2845,11 +2838,6 @@ const App = () => {
 
   // ============ RENDER ============
   return e('div', { className: "min-h-screen bg-black pb-20 pt-safe" },
-    
-    // Status header for non-PWA mode (subtle install hint)
-    !window.matchMedia('(display-mode: standalone)').matches && e('div', { 
-      className: "bg-emerald-500/10 border-b border-emerald-500/20 px-4 py-2 text-center text-xs text-emerald-300 font-mono-d"
-    }, "Tap Share → Add to Home Screen for the full app experience"),
     
     // ============ HOME TAB ============
     activeTab === "home" && (() => {
